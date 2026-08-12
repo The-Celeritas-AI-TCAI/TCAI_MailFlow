@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bulk Mail Sender</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+    <main class="container">
+        <header class="page-header">
+            <h1>Bulk Mail Sender</h1>
+            <p>Upload contacts, extract email addresses, compose your message, and send.</p>
+        </header>
+
+        <section class="card">
+            <div class="step-title">
+                <span>1</span>
+                <div>
+                    <h2>Upload Contacts</h2>
+                    <p>PDF, CSV, XLS, or XLSX</p>
+                </div>
+            </div>
+
+            <form id="uploadForm">
+                <div class="upload-box">
+                    <input
+                        type="file"
+                        id="dataFile"
+                        name="file"
+                        accept=".pdf,.csv,.xls,.xlsx"
+                        required
+                    >
+                    <label for="dataFile" class="file-label">
+                        Choose PDF / Excel / CSV
+                    </label>
+                    <p id="selectedDataFile" class="file-name">No file selected</p>
+                </div>
+
+                <button type="submit" id="uploadBtn" class="btn primary">
+                    Upload & Extract Emails
+                </button>
+            </form>
+
+            <div id="uploadStatus" class="status hidden"></div>
+
+            <div id="fileSummary" class="summary hidden">
+                <div>
+                    <span>File</span>
+                    <strong id="summaryFile">-</strong>
+                </div>
+                <div>
+                    <span>Email column</span>
+                    <strong id="summaryColumn">-</strong>
+                </div>
+                <div>
+                    <span>Total records</span>
+                    <strong id="summaryTotal">-</strong>
+                </div>
+                <div>
+                    <span>Valid emails</span>
+                    <strong id="summaryValid">-</strong>
+                </div>
+                <div>
+                    <span>Invalid</span>
+                    <strong id="summaryInvalid">-</strong>
+                </div>
+            </div>
+
+            <div id="emailPreviewSection" class="hidden">
+                <h3>Extracted Email Addresses</h3>
+                <textarea id="emailPreview" rows="8" readonly></textarea>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="step-title">
+                <span>2</span>
+                <div>
+                    <h2>Compose Email</h2>
+                    <p>Enter the message to send</p>
+                </div>
+            </div>
+
+            <label for="subject">Subject</label>
+            <input
+                type="text"
+                id="subject"
+                placeholder="Enter email subject"
+            >
+
+            <label for="body">Message</label>
+            <textarea
+                id="body"
+                rows="9"
+                placeholder="Write your email message here..."
+            ></textarea>
+
+            <label for="attachment">Optional Attachment</label>
+            <input type="file" id="attachment">
+            <p id="attachmentStatus" class="file-name">No attachment selected</p>
+        </section>
+
+        <section class="card">
+            <div class="step-title">
+                <span>3</span>
+                <div>
+                    <h2>Send</h2>
+                    <p>Send the email to all extracted addresses</p>
+                </div>
+            </div>
+
+            <button type="button" id="sendBtn" class="btn success" disabled>
+                Send Emails
+            </button>
+
+            <div id="sendStatus" class="status hidden"></div>
+        </section>
+
+        <section id="resultsCard" class="card hidden">
+            <div class="step-title">
+                <span>4</span>
+                <div>
+                    <h2>Results</h2>
+                    <p>Campaign summary</p>
+                </div>
+            </div>
+
+            <div class="result-grid">
+                <div>
+                    <span>Total</span>
+                    <strong id="resultTotal">0</strong>
+                </div>
+                <div>
+                    <span>Sent</span>
+                    <strong id="resultSent">0</strong>
+                </div>
+                <div>
+                    <span>Failed</span>
+                    <strong id="resultFailed">0</strong>
+                </div>
+            </div>
+
+            <div id="failedSection" class="hidden">
+                <h3>Failed Emails</h3>
+                <div id="failedList"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='style.js') }}"></script>
+</body>
+</html>
