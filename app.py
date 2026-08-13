@@ -3,6 +3,7 @@ import re
 import smtplib
 import pandas as pd
 import pdfplumber
+import time
 
 from flask import Flask, render_template, request, jsonify
 from werkzeug.utils import secure_filename
@@ -47,8 +48,24 @@ def validate_email(email):
     if not isinstance(email, str):
         return False
 
-    email = email.strip()
-    return bool(EMAIL_REGEX.match(email))
+    email = email.strip().lower()
+
+    if not EMAIL_REGEX.match(email):
+        return False
+
+    blocked_domains = {
+        "example.com",
+        "example.org",
+        "example.net",
+        "txt.com"
+    }
+
+    domain = email.split("@")[1]
+
+    if domain in blocked_domains:
+        return False
+
+    return True
 
 
 def normalize_column_name(column):
@@ -67,6 +84,7 @@ def find_email_column(columns):
         "emailaddress",
         "emailid",
         "mail",
+        "Email"
     }
 
     normalized_columns = {normalize_column_name(col): col for col in columns}
@@ -411,7 +429,8 @@ def send_emails():
                     "success": False,
                     "message": "The selected attachment is empty."
                 }), 400
-
+                
+        start_time = time.time()
         smtp = smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT, timeout=30)
         smtp.ehlo()
         smtp.starttls()
@@ -452,7 +471,12 @@ def send_emails():
                     "email": recipient,
                     "error": str(exc)
                 })
+                
+        end_time = time.time()
+        total_time = round(end_time - start_time, 2)
 
+        avg_time = round(total_time / sent, 2) if sent > 0 else 0
+        
         return jsonify({
             "success": True,
             "message": "Campaign completed.",
@@ -460,7 +484,9 @@ def send_emails():
             "sent": sent,
             "failed": len(failed),
             "failed_details": failed,
-            "attachment_name": attachment_filename
+            "attachment_name": attachment_filename,
+            "total_time": total_time,
+            "avg_time_per_email": avg_time
         })
 
     except ValueError as exc:
