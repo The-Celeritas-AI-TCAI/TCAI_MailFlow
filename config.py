@@ -1,3 +1,4 @@
+
 """
 config.py
 Loads application configuration from environment variables (.env file).
@@ -14,10 +15,11 @@ class Config:
     """Central configuration object for the Bulk Email Sender app."""
 
     # --- SMTP / Gmail settings ---
-    GMAIL_EMAIL = os.environ.get("GMAIL_EMAIL")
-    GMAIL_PASSWORD = os.environ.get("GMAIL_PASSWORD")
-    SMTP_SERVER = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
-    SMTP_PORT = int(os.environ.get("SMTP_PORT", 587))
+    SMTP_USERNAME = os.getenv("SMTP_USERNAME")
+    SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+
+    SMTP_SERVER = os.getenv("SMTP_SERVER")
+    SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 
     # --- Flask / upload settings ---
     SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-key-change-in-production")
@@ -39,8 +41,8 @@ class Config:
     @staticmethod
     def validate_smtp_config():
         """Raise a clear error if SMTP credentials are missing."""
-        if not Config.GMAIL_EMAIL or not Config.GMAIL_PASSWORD:
+        if not Config.SMTP_USERNAME or not Config.SMTP_PASSWORD:
             raise ValueError(
-                "Email sending is not configured. Please set GMAIL_EMAIL and "
-                "GMAIL_PASSWORD (a Gmail App Password) in your .env file."
+                "Email sending is not configured. Please set SMTP_USERNAME and "
+                "SMTP_PASSWORD  in your .env file."
             )

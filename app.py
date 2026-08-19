@@ -1,3 +1,4 @@
+
 import os
 import re
 import smtplib
@@ -435,7 +436,7 @@ def send_emails():
         smtp.ehlo()
         smtp.starttls()
         smtp.ehlo()
-        smtp.login(Config.GMAIL_EMAIL, Config.GMAIL_PASSWORD)
+        smtp.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
 
         sent = 0
         failed = []
@@ -443,7 +444,7 @@ def send_emails():
         for recipient in emails:
             try:
                 message = MIMEMultipart()
-                message["From"] = Config.GMAIL_EMAIL
+                message["From"] = Config.SMTP_USERNAME
                 message["To"] = recipient
                 message["Subject"] = subject
                 message.attach(MIMEText(body, "plain", "utf-8"))
@@ -459,7 +460,7 @@ def send_emails():
                     message.attach(part)
 
                 smtp.sendmail(
-                    Config.GMAIL_EMAIL,
+                    Config.SMTP_USERNAME,
                     recipient,
                     message.as_string()
                 )
@@ -495,13 +496,12 @@ def send_emails():
             "message": str(exc)
         }), 400
 
-    except smtplib.SMTPAuthenticationError:
+    except smtplib.SMTPAuthenticationError as exc:
+        app.logger.exception("Zoho SMTP authentication failed")
+
         return jsonify({
             "success": False,
-            "message": (
-                "SMTP authentication failed. Check your Gmail email "
-                "and Gmail App Password."
-            )
+            "message": f"Zoho SMTP authentication failed: {exc}"
         }), 500
 
     except (smtplib.SMTPException, OSError) as exc:
@@ -517,6 +517,14 @@ def send_emails():
             "message": f"Unexpected sending error: {exc}"
         }), 500
 
+    finally:
+        if smtp is not None:
+            try:
+                smtp.quit()
+            except Exception:
+                pass
+
 
 if __name__ == "__main__":
     app.run(debug=True)
+   
