@@ -517,13 +517,6 @@ def send_emails():
             "message": f"Unexpected sending error: {exc}"
         }), 500
 
-    finally:
-        if smtp is not None:
-            try:
-                smtp.quit()
-            except Exception:
-                pass
-
 
 if __name__ == "__main__":
     app.run(debug=True)
