@@ -4,3 +4,6 @@ venv/
 __pycache__/
 *.pyc
 uploads/
+mailflow.db
+mailflow.db-shm
+mailflow.db-wal

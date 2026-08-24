@@ -1,530 +1,236 @@
-
 import os
 import re
-import smtplib
+import shutil
+import sqlite3
+import uuid
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 import pandas as pd
 import pdfplumber
-import time
-
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 
+import database
 from config import Config
-
+from email_worker import campaign_manager, estimate_message_size
 
 app = Flask(__name__)
 app.config.from_object(Config)
-
-# Make sure upload folder exists.
 os.makedirs(app.config["UPLOAD_FOLDER"], exist_ok=True)
-
+os.makedirs(Config.CAMPAIGN_ATTACHMENT_FOLDER, exist_ok=True)
+database.init_database()
+campaign_manager.start()
 
 EMAIL_REGEX = re.compile(r"^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$")
 
 
 def allowed_data_file(filename):
-    """Check whether the uploaded contact file has a supported extension."""
-    if not filename or "." not in filename:
-        return False
-
-    extension = filename.rsplit(".", 1)[1].lower()
-    return extension in Config.ALLOWED_DATA_EXTENSIONS
+    return bool(filename and "." in filename and filename.rsplit(".", 1)[1].lower() in Config.ALLOWED_DATA_EXTENSIONS)
 
 
 def allowed_attachment_file(filename):
-    """Check whether the attachment has a supported extension."""
-    if not filename or "." not in filename:
-        return False
-
-    extension = filename.rsplit(".", 1)[1].lower()
-    return extension in Config.ALLOWED_ATTACHMENT_EXTENSIONS
+    return bool(filename and "." in filename and filename.rsplit(".", 1)[1].lower() in Config.ALLOWED_ATTACHMENT_EXTENSIONS)
 
 
 def validate_email(email):
-    """Basic email format validation."""
-    if not isinstance(email, str):
+    if not isinstance(email, str) or not EMAIL_REGEX.match(email.strip().lower()):
         return False
-
-    email = email.strip().lower()
-
-    if not EMAIL_REGEX.match(email):
-        return False
-
-    blocked_domains = {
-        "example.com",
-        "example.org",
-        "example.net",
-        "txt.com"
-    }
-
-    domain = email.split("@")[1]
-
-    if domain in blocked_domains:
-        return False
-
-    return True
+    return email.strip().lower().split("@", 1)[1] not in {"example.com", "example.org", "example.net", "txt.com"}
 
 
 def normalize_column_name(column):
-    """Normalize a column name for reliable Email-column detection."""
     return re.sub(r"[^a-z0-9]", "", str(column).strip().lower())
 
 
 def find_email_column(columns):
-    """
-    Find an Email-related column.
-    Supports examples like:
-    Email, E-mail, Email Address, E-mail Address, email_id, emailId
-    """
-    exact_names = {
-        "email",
-        "emailaddress",
-        "emailid",
-        "mail",
-        "Email"
-    }
-
-    normalized_columns = {normalize_column_name(col): col for col in columns}
-
-    # Prefer exact known names.
-    for normalized, original in normalized_columns.items():
-        if normalized in exact_names:
-            return original
-
-    # Fallback for names such as customeremail / primaryemail.
-    for normalized, original in normalized_columns.items():
-        if "email" in normalized or normalized == "mail":
-            return original
-
-    return None
+    normalized = {normalize_column_name(column): column for column in columns}
+    for key, value in normalized.items():
+        if key in {"email", "emailaddress", "emailid", "mail"}: return value
+    return next((value for key, value in normalized.items() if "email" in key), None)
 
 
 def clean_dataframe(df):
-    """Clean headers and remove fully empty rows."""
-    df = df.copy()
-    df.columns = [str(col).strip() for col in df.columns]
-    df = df.dropna(how="all")
-    return df
+    df = df.copy(); df.columns = [str(column).strip() for column in df.columns]
+    return df.dropna(how="all")
 
 
-def parse_csv(file_path):
-    """Read CSV into a DataFrame."""
-    return clean_dataframe(pd.read_csv(file_path))
-
-
-def parse_excel(file_path, extension):
-    """Read XLS/XLSX into a DataFrame."""
-    engine = "xlrd" if extension == "xls" else "openpyxl"
-    return clean_dataframe(pd.read_excel(file_path, engine=engine))
-
-
-def parse_pdf(file_path):
-    """
-    Extract table data from a PDF using pdfplumber.
-
-    This basic implementation expects the PDF to contain a table with
-    a header row containing an Email-related column.
-    """
-    all_tables = []
-
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            tables = page.extract_tables()
-
-            for table in tables:
-                if not table:
-                    continue
-
-                # Remove completely empty rows.
-                table = [
-                    row for row in table
-                    if row and any(cell is not None and str(cell).strip() for cell in row)
-                ]
-
-                if not table:
-                    continue
-
-                header = table[0]
-                data = table[1:]
-
-                if not header:
-                    continue
-
-                headers = []
-                for index, value in enumerate(header):
-                    text = "" if value is None else str(value).strip()
-                    headers.append(text if text else f"Column_{index + 1}")
-
-                # Make row lengths match header length.
-                normalized_rows = []
-                for row in data:
-                    row = list(row)
-                    row += [None] * (len(headers) - len(row))
-                    normalized_rows.append(row[:len(headers)])
-
-                if normalized_rows:
-                    all_tables.append(pd.DataFrame(normalized_rows, columns=headers))
-
-    if not all_tables:
-        raise ValueError(
-            "No readable tables were found in the PDF."
-        )
-
-    return clean_dataframe(pd.concat(all_tables, ignore_index=True))
-
-
-def parse_data_file(file_path, filename):
-    """Select the correct parser based on file extension."""
+def parse_data_file(path, filename):
     extension = filename.rsplit(".", 1)[1].lower()
-
-    if extension == "csv":
-        return parse_csv(file_path)
-
-    if extension in {"xls", "xlsx"}:
-        return parse_excel(file_path, extension)
-
-    if extension == "pdf":
-        return parse_pdf(file_path)
-
-    raise ValueError("Unsupported data file type.")
+    if extension == "csv": return clean_dataframe(pd.read_csv(path))
+    if extension in {"xls", "xlsx"}: return clean_dataframe(pd.read_excel(path, engine="xlrd" if extension == "xls" else "openpyxl"))
+    if extension != "pdf": raise ValueError("Unsupported data file type.")
+    tables = []
+    with pdfplumber.open(path) as pdf:
+        for page in pdf.pages:
+            for table in page.extract_tables() or []:
+                rows = [row for row in table if row and any(cell is not None and str(cell).strip() for cell in row)]
+                if len(rows) < 2: continue
+                headers = [str(value).strip() if value else f"Column_{index + 1}" for index, value in enumerate(rows[0])]
+                tables.append(pd.DataFrame([(list(row) + [None] * len(headers))[:len(headers)] for row in rows[1:]], columns=headers))
+    if not tables: raise ValueError("No readable tables were found in the PDF.")
+    return clean_dataframe(pd.concat(tables, ignore_index=True))
 
 
 def extract_emails_from_dataframe(df):
-    """
-    Find the Email column, validate email addresses, remove duplicates,
-    and preserve original order.
-    """
-    email_column = find_email_column(df.columns)
-
-    if not email_column:
-        detected_columns = ", ".join(str(col) for col in df.columns)
-        raise ValueError(
-            f"No Email column found in the uploaded file. "
-            f"Detected columns: {detected_columns or 'None'}"
-        )
-
-    valid_emails = []
-    invalid_count = 0
-    seen = set()
-
-    for value in df[email_column]:
-        if pd.isna(value):
-            continue
-
+    column = find_email_column(df.columns)
+    if not column: raise ValueError(f"No Email column found. Detected columns: {', '.join(map(str, df.columns)) or 'None'}")
+    emails, seen, invalid = [], set(), 0
+    for value in df[column]:
+        if pd.isna(value): continue
         email = str(value).strip().lower()
+        if not email: continue
+        if validate_email(email) and email not in seen: emails.append(email); seen.add(email)
+        elif not validate_email(email): invalid += 1
+    if not emails: raise ValueError("Email column found, but no valid email addresses were detected.")
+    return column, emails, invalid
 
-        if not email:
-            continue
 
-        if validate_email(email):
-            if email not in seen:
-                seen.add(email)
-                valid_emails.append(email)
-        else:
-            invalid_count += 1
+def parse_emails(text):
+    seen, emails = set(), []
+    for raw in re.split(r"[\n,;]+", text or ""):
+        email = raw.strip().lower()
+        if email and validate_email(email) and email not in seen: emails.append(email); seen.add(email)
+    return emails
 
-    if not valid_emails:
-        raise ValueError(
-            "Email column found, but no valid email addresses were detected."
-        )
 
-    return email_column, valid_emails, invalid_count
+def save_attachments(campaign_id):
+    """Stream each attachment once to its campaign directory; never store bytes in SQLite."""
+    attachments, total = [], 0
+    files = [upload for upload in request.files.getlist("attachments[]") + request.files.getlist("attachment") if upload and upload.filename]
+    if not files:
+        return attachments
+    required = request.content_length or 0
+    available = shutil.disk_usage(Config.CAMPAIGN_ATTACHMENT_FOLDER).free
+    if available < required + 5 * 1024 * 1024:
+        raise ValueError(f"Insufficient disk space to create this campaign (available: {available / 1024 / 1024:.1f} MB).")
+    directory = os.path.join(Config.CAMPAIGN_ATTACHMENT_FOLDER, campaign_id)
+    os.makedirs(directory, exist_ok=False)
+    try:
+        used_names = set()
+        for upload in files:
+            if not upload or not upload.filename: continue
+            filename = secure_filename(upload.filename)
+            if not filename or not allowed_attachment_file(filename): raise ValueError(f"Attachment '{upload.filename}' has an unsupported file type.")
+            stem, extension = os.path.splitext(filename); candidate, index = filename, 2
+            while candidate.lower() in used_names:
+                candidate = f"{stem}_{index}{extension}"; index += 1
+            used_names.add(candidate.lower())
+            path, size = os.path.join(directory, candidate), 0
+            with open(path, "wb") as target:
+                while chunk := upload.stream.read(1024 * 1024):
+                    size += len(chunk); total += len(chunk)
+                    if size > Config.MAX_ATTACHMENT_SIZE: raise ValueError(f"Attachment '{candidate}' exceeds MAX_ATTACHMENT_SIZE.")
+                    if total > Config.MAX_TOTAL_ATTACHMENT_SIZE: raise ValueError("Attachments exceed MAX_TOTAL_ATTACHMENT_SIZE.")
+                    target.write(chunk)
+            if not size: raise ValueError(f"Attachment '{candidate}' is empty.")
+            attachments.append({"filename": candidate, "file_path": os.path.abspath(path), "size": size, "mime_type": upload.mimetype or None})
+        return attachments
+    except Exception:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+
+
+def parse_schedule():
+    scheduled_date, scheduled_time = request.form.get("schedule_date", ""), request.form.get("schedule_time", "")
+    if not scheduled_date and not scheduled_time: return None, None
+    if not scheduled_date or not scheduled_time: raise ValueError("Both schedule date and time are required.")
+    timezone_name = request.form.get("timezone", Config.SCHEDULER_TIMEZONE)
+    try:
+        scheduled = datetime.fromisoformat(f"{scheduled_date}T{scheduled_time}").replace(tzinfo=ZoneInfo(timezone_name))
+    except (ValueError, TypeError, KeyError): raise ValueError("Schedule date, time, or timezone is invalid.")
+    if scheduled <= datetime.now(ZoneInfo(timezone_name)): raise ValueError("Scheduled time must be in the future.")
+    return scheduled.astimezone(ZoneInfo("UTC")).isoformat(), timezone_name
 
 
 @app.route("/")
-def index():
-    return render_template("index.html")
+def index(): return render_template("index.html")
 
 
 @app.route("/upload-file", methods=["POST"])
 def upload_file():
     try:
-        if "file" not in request.files:
-            return jsonify({
-                "success": False,
-                "message": "Please select a PDF, CSV, XLS, or XLSX file."
-            }), 400
-
-        uploaded_file = request.files["file"]
-
-        if not uploaded_file.filename:
-            return jsonify({
-                "success": False,
-                "message": "No file selected."
-            }), 400
-
-        if not allowed_data_file(uploaded_file.filename):
-            return jsonify({
-                "success": False,
-                "message": "Unsupported file type. Please upload PDF, CSV, XLS, or XLSX."
-            }), 400
-
-        filename = secure_filename(uploaded_file.filename)
-
-        if not filename:
-            return jsonify({
-                "success": False,
-                "message": "Invalid filename."
-            }), 400
-
-        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-        uploaded_file.save(file_path)
-
+        upload = request.files.get("file")
+        if not upload or not upload.filename: return jsonify(success=False, message="Please select a PDF, CSV, XLS, or XLSX file."), 400
+        if not allowed_data_file(upload.filename): return jsonify(success=False, message="Unsupported file type. Please upload PDF, CSV, XLS, or XLSX."), 400
+        filename = secure_filename(upload.filename)
+        content = upload.read()
+        if not content: return jsonify(success=False, message="The uploaded file is empty."), 400
+        if len(content) > Config.MAX_CONTACT_FILE_SIZE: return jsonify(success=False, message="Contact file exceeds MAX_CONTACT_FILE_SIZE."), 400
+        path = os.path.join(app.config["UPLOAD_FOLDER"], f"contact_{os.urandom(8).hex()}_{filename}")
+        with open(path, "wb") as file: file.write(content)
         try:
-            df = parse_data_file(file_path, filename)
-            email_column, emails, invalid_count = extract_emails_from_dataframe(df)
-
-            return jsonify({
-                "success": True,
-                "message": "File uploaded and processed successfully.",
-                "filename": filename,
-                "email_column": str(email_column),
-                "total_records": int(len(df)),
-                "valid_email_count": int(len(emails)),
-                "invalid_email_count": int(invalid_count),
-                "emails": emails,
-                "next_step": (
-                    "Email addresses extracted successfully. "
-                    "Enter the subject and message, optionally attach a file, then send."
-                )
-            })
-
-        finally:
-            # The contact file is no longer required after extraction.
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
-
-    except ValueError as exc:
-        return jsonify({
-            "success": False,
-            "message": str(exc)
-        }), 400
-
-    except pd.errors.EmptyDataError:
-        return jsonify({
-            "success": False,
-            "message": "The uploaded file is empty."
-        }), 400
-
+            df = parse_data_file(path, filename); column, emails, invalid = extract_emails_from_dataframe(df)
+        finally: os.remove(path)
+        return jsonify(success=True, message="File uploaded and processed successfully.", filename=filename, email_column=str(column), total_records=int(len(df)), valid_email_count=len(emails), invalid_email_count=invalid, emails=emails, next_step="Email addresses extracted successfully. Enter the subject and message, optionally attach files, then send.")
+    except ValueError as exc: return jsonify(success=False, message=str(exc)), 400
+    except pd.errors.EmptyDataError: return jsonify(success=False, message="The uploaded file is empty."), 400
     except Exception as exc:
-        app.logger.exception("Upload processing error")
-        return jsonify({
-            "success": False,
-            "message": f"Could not process the file: {exc}"
-        }), 500
-
-
-def build_message(sender, recipient, subject, body, attachment):
-    """Create a MIME email with an optional attachment."""
-    message = MIMEMultipart()
-    message["From"] = sender
-    message["To"] = recipient
-    message["Subject"] = subject
-
-    message.attach(MIMEText(body, "plain", "utf-8"))
-
-    if attachment:
-        filename = secure_filename(attachment.filename)
-
-        if not allowed_attachment_file(filename):
-            raise ValueError("Attachment file type is not allowed.")
-
-        attachment_bytes = attachment.read()
-
-        if len(attachment_bytes) > Config.MAX_ATTACHMENT_SIZE:
-            raise ValueError("Attachment is larger than the allowed size.")
-
-        if not attachment_bytes:
-            raise ValueError("The selected attachment is empty.")
-
-        part = MIMEBase("application", "octet-stream")
-        part.set_payload(attachment_bytes)
-        encoders.encode_base64(part)
-        part.add_header(
-            "Content-Disposition",
-            f'attachment; filename="{filename}"'
-        )
-        message.attach(part)
-
-    return message
+        app.logger.exception("Upload processing error"); return jsonify(success=False, message=f"Could not process the file: {exc}"), 500
 
 
 @app.route("/send-emails", methods=["POST"])
 def send_emails():
-    smtp = None
-
+    campaign_id = None
     try:
         Config.validate_smtp_config()
-
-        emails_text = request.form.get("emails", "").strip()
-        subject = request.form.get("subject", "").strip()
-        body = request.form.get("body", "").strip()
-        attachment = request.files.get("attachment")
-
-        if not emails_text:
-            return jsonify({
-                "success": False,
-                "message": "No email addresses were provided."
-            }), 400
-
-        if not subject:
-            return jsonify({
-                "success": False,
-                "message": "Subject is required."
-            }), 400
-
-        if not body:
-            return jsonify({
-                "success": False,
-                "message": "Email body is required."
-            }), 400
-
-        emails = []
-        seen = set()
-
-        # Accept newline, comma, or semicolon separated emails.
-        raw_emails = re.split(r"[\n,;]+", emails_text)
-
-        for raw_email in raw_emails:
-            email = raw_email.strip().lower()
-
-            if email and validate_email(email) and email not in seen:
-                seen.add(email)
-                emails.append(email)
-
-        if not emails:
-            return jsonify({
-                "success": False,
-                "message": "No valid email addresses were found."
-            }), 400
-
-        # Read attachment once so it can be recreated for every message.
-        attachment_bytes = None
-        attachment_filename = None
-
-        if attachment and attachment.filename:
-            attachment_filename = secure_filename(attachment.filename)
-
-            if not allowed_attachment_file(attachment_filename):
-                return jsonify({
-                    "success": False,
-                    "message": "Attachment file type is not allowed."
-                }), 400
-
-            attachment_bytes = attachment.read()
-
-            if len(attachment_bytes) > Config.MAX_ATTACHMENT_SIZE:
-                return jsonify({
-                    "success": False,
-                    "message": "Attachment is larger than the allowed size."
-                }), 400
-
-            if not attachment_bytes:
-                return jsonify({
-                    "success": False,
-                    "message": "The selected attachment is empty."
-                }), 400
-                
-        start_time = time.time()
-        smtp = smtplib.SMTP(Config.SMTP_SERVER, Config.SMTP_PORT, timeout=30)
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.ehlo()
-        smtp.login(Config.SMTP_USERNAME, Config.SMTP_PASSWORD)
-
-        sent = 0
-        failed = []
-
-        for recipient in emails:
-            try:
-                message = MIMEMultipart()
-                message["From"] = Config.SMTP_USERNAME
-                message["To"] = recipient
-                message["Subject"] = subject
-                message.attach(MIMEText(body, "plain", "utf-8"))
-
-                if attachment_bytes is not None:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(attachment_bytes)
-                    encoders.encode_base64(part)
-                    part.add_header(
-                        "Content-Disposition",
-                        f'attachment; filename="{attachment_filename}"'
-                    )
-                    message.attach(part)
-
-                smtp.sendmail(
-                    Config.SMTP_USERNAME,
-                    recipient,
-                    message.as_string()
-                )
-
-                sent += 1
-
-            except Exception as exc:
-                failed.append({
-                    "email": recipient,
-                    "error": str(exc)
-                })
-                
-        end_time = time.time()
-        total_time = round(end_time - start_time, 2)
-
-        avg_time = round(total_time / sent, 2) if sent > 0 else 0
-        
-        return jsonify({
-            "success": True,
-            "message": "Campaign completed.",
-            "total": len(emails),
-            "sent": sent,
-            "failed": len(failed),
-            "failed_details": failed,
-            "attachment_name": attachment_filename,
-            "total_time": total_time,
-            "avg_time_per_email": avg_time
-        })
-
+        emails, subject, body = parse_emails(request.form.get("emails")), request.form.get("subject", "").strip(), request.form.get("body", "").strip()
+        if not emails: return jsonify(success=False, message="No valid email addresses were found."), 400
+        if not subject or not body: return jsonify(success=False, message="Subject and email body are required."), 400
+        campaign_id = str(uuid.uuid4()); attachments = save_attachments(campaign_id); estimated_size = estimate_message_size(body, attachments)
+        if estimated_size > Config.SMTP_MAX_MESSAGE_SIZE:
+            raise ValueError(f"Estimated email size ({estimated_size / 1024 / 1024:.2f} MB) exceeds the configured SMTP limit ({Config.SMTP_MAX_MESSAGE_SIZE / 1024 / 1024:.2f} MB).")
+        scheduled_at, timezone_name = parse_schedule()
+        campaign_id = database.create_campaign(emails, subject, body, attachments, scheduled_at, timezone_name, request.form.get("campaign_name", "").strip() or None, campaign_id)
+        if not scheduled_at: campaign_manager.enqueue(campaign_id)
+        campaign = database.get_campaign(campaign_id)
+        return jsonify(success=True, message="Campaign scheduled." if scheduled_at else "Campaign accepted and queued.", campaign_id=campaign_id, estimated_email_size=estimated_size, **campaign), 202
     except ValueError as exc:
-        return jsonify({
-            "success": False,
-            "message": str(exc)
-        }), 400
-
-    except smtplib.SMTPAuthenticationError as exc:
-        app.logger.exception("Zoho SMTP authentication failed")
-
-        return jsonify({
-            "success": False,
-            "message": f"Zoho SMTP authentication failed: {exc}"
-        }), 500
-
-    except (smtplib.SMTPException, OSError) as exc:
-        return jsonify({
-            "success": False,
-            "message": f"SMTP connection error: {exc}"
-        }), 500
-
+        if campaign_id: shutil.rmtree(os.path.join(Config.CAMPAIGN_ATTACHMENT_FOLDER, campaign_id), ignore_errors=True)
+        return jsonify(success=False, message=str(exc)), 400
+    except sqlite3.OperationalError as exc:
+        if campaign_id: shutil.rmtree(os.path.join(Config.CAMPAIGN_ATTACHMENT_FOLDER, campaign_id), ignore_errors=True)
+        app.logger.exception("Campaign storage error")
+        message = "Unable to create campaign because storage is full." if "full" in str(exc).lower() else "Unable to create campaign because the database could not be written."
+        return jsonify(success=False, message=message), 507 if "full" in str(exc).lower() else 500
+    except RuntimeError as exc: return jsonify(success=False, message=str(exc)), 503
     except Exception as exc:
-        app.logger.exception("Email sending error")
-        return jsonify({
-            "success": False,
-            "message": f"Unexpected sending error: {exc}"
-        }), 500
-
-    finally:
-        if smtp is not None:
-            try:
-                smtp.quit()
-            except Exception:
-                pass
+        if campaign_id: shutil.rmtree(os.path.join(Config.CAMPAIGN_ATTACHMENT_FOLDER, campaign_id), ignore_errors=True)
+        app.logger.exception("Campaign creation error"); return jsonify(success=False, message="Could not create campaign."), 500
 
 
-if __name__ == "__main__":
-    app.run(debug=True)
-   
+@app.route("/campaign/<campaign_id>/status")
+def campaign_status(campaign_id):
+    campaign = database.get_campaign(campaign_id)
+    return (jsonify(success=True, campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
+
+
+@app.route("/campaigns")
+def campaigns(): return jsonify(success=True, campaigns=database.list_campaigns())
+
+
+@app.route("/campaign/<campaign_id>/cancel", methods=["POST"])
+def cancel_campaign(campaign_id):
+    campaign = database.cancel_campaign(campaign_id)
+    return (jsonify(success=True, campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
+
+
+@app.route("/campaign/<campaign_id>/retry-failed", methods=["POST"])
+def retry_failed(campaign_id):
+    new_id = database.retry_failed_campaign(campaign_id)
+    if not new_id: return jsonify(success=False, message="No failed recipients are available to retry."), 400
+    campaign_manager.enqueue(new_id); campaign = database.get_campaign(new_id)
+    return jsonify(success=True, message="Failed recipients queued for retry.", campaign_id=new_id, **campaign), 202
+
+
+@app.route("/campaign/<campaign_id>", methods=["DELETE"])
+def delete_campaign(campaign_id):
+    return (jsonify(success=True), 200) if database.delete_campaign(campaign_id) else (jsonify(success=False, message="Campaign not found."), 404)
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def request_too_large(_): return jsonify(success=False, message="Upload exceeds MAX_CONTENT_LENGTH."), 413
+
+
+if __name__ == "__main__": app.run(debug=False)
