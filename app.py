@@ -3,6 +3,7 @@ import re
 import shutil
 import sqlite3
 import uuid
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -15,6 +16,10 @@ from werkzeug.utils import secure_filename
 import database
 from config import Config
 from email_worker import campaign_manager, estimate_message_size
+from supabase_recipients import SupabaseRecipientError, fetch_recipient_emails
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
 app = Flask(__name__)
 app.config.from_object(Config)
@@ -144,6 +149,19 @@ def parse_schedule():
     return scheduled.astimezone(ZoneInfo("UTC")).isoformat(), timezone_name
 
 
+def parse_pause_settings():
+    raw_after, raw_minutes = request.form.get("automatic_pause_after", "0").strip(), request.form.get("automatic_pause_minutes", "0").strip()
+    try:
+        after, minutes = int(raw_after or 0), int(raw_minutes or 0)
+    except ValueError:
+        raise ValueError("Automatic pause settings must be whole numbers.")
+    if after < 0 or minutes < 0:
+        raise ValueError("Automatic pause settings cannot be negative.")
+    if bool(after) != bool(minutes):
+        raise ValueError("Set both emails-between-pauses and pause duration, or leave both at 0 to disable automatic pausing.")
+    return after, minutes
+
+
 @app.route("/")
 def index(): return render_template("index.html")
 
@@ -170,6 +188,15 @@ def upload_file():
         app.logger.exception("Upload processing error"); return jsonify(success=False, message=f"Could not process the file: {exc}"), 500
 
 
+@app.route("/fetch-supabase-recipients", methods=["POST"])
+def fetch_supabase_recipients():
+    try:
+        result = fetch_recipient_emails(validate_email)
+        return jsonify(success=True, source="Supabase Database", message="Recipients fetched from Supabase.", **result)
+    except SupabaseRecipientError as exc:
+        return jsonify(success=False, message=str(exc)), 503
+
+
 @app.route("/send-emails", methods=["POST"])
 def send_emails():
     campaign_id = None
@@ -181,8 +208,8 @@ def send_emails():
         campaign_id = str(uuid.uuid4()); attachments = save_attachments(campaign_id); estimated_size = estimate_message_size(body, attachments)
         if estimated_size > Config.SMTP_MAX_MESSAGE_SIZE:
             raise ValueError(f"Estimated email size ({estimated_size / 1024 / 1024:.2f} MB) exceeds the configured SMTP limit ({Config.SMTP_MAX_MESSAGE_SIZE / 1024 / 1024:.2f} MB).")
-        scheduled_at, timezone_name = parse_schedule()
-        campaign_id = database.create_campaign(emails, subject, body, attachments, scheduled_at, timezone_name, request.form.get("campaign_name", "").strip() or None, campaign_id)
+        scheduled_at, timezone_name = parse_schedule(); pause_after, pause_minutes = parse_pause_settings()
+        campaign_id = database.create_campaign(emails, subject, body, attachments, scheduled_at, timezone_name, request.form.get("campaign_name", "").strip() or None, campaign_id, pause_after, pause_minutes)
         if not scheduled_at: campaign_manager.enqueue(campaign_id)
         campaign = database.get_campaign(campaign_id)
         return jsonify(success=True, message="Campaign scheduled." if scheduled_at else "Campaign accepted and queued.", campaign_id=campaign_id, estimated_email_size=estimated_size, **campaign), 202
@@ -214,6 +241,20 @@ def campaigns(): return jsonify(success=True, campaigns=database.list_campaigns(
 def cancel_campaign(campaign_id):
     campaign = database.cancel_campaign(campaign_id)
     return (jsonify(success=True, campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
+
+
+@app.route("/campaign/<campaign_id>/pause", methods=["POST"])
+def pause_campaign(campaign_id):
+    campaign = database.pause_campaign(campaign_id)
+    return (jsonify(success=True, message="Campaign paused; any active send can finish safely.", campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
+
+
+@app.route("/campaign/<campaign_id>/resume", methods=["POST"])
+def resume_campaign(campaign_id):
+    campaign = database.resume_campaign(campaign_id)
+    if campaign and campaign["status"] in ("queued", "running", "resuming"):
+        campaign_manager.enqueue(campaign_id)
+    return (jsonify(success=True, message="Campaign resumed.", campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
 
 
 @app.route("/campaign/<campaign_id>/retry-failed", methods=["POST"])

@@ -68,9 +68,9 @@ class CampaignFailureIsolationTest(unittest.TestCase):
 
         campaign = database.get_campaign(campaign_id)
         self.assertEqual(campaign["sent"], 2)
-        self.assertEqual(campaign["failed"], 1)
-        self.assertEqual(campaign["status"], "partially_failed")
-        self.assertEqual(calls.count("broken@example.test"), 2)
+        self.assertEqual(campaign["retrying"], 1)
+        self.assertEqual(campaign["status"], "running")
+        self.assertEqual(calls.count("broken@example.test"), 1)
         self.assertIn("third@example.test", calls)
 
     def test_new_attachment_rows_store_only_filesystem_metadata(self):
@@ -109,9 +109,32 @@ class CampaignFailureIsolationTest(unittest.TestCase):
             manager.recipient_queue.join()
 
         campaign = database.get_campaign(campaign_id)
-        self.assertEqual((campaign["sent"], campaign["failed"], campaign["status"]), (2, 1, "partially_failed"))
-        self.assertEqual(calls.count("timeout@example.test"), 2)
+        self.assertEqual((campaign["sent"], campaign["retrying"], campaign["status"]), (2, 1, "running"))
+        self.assertEqual(calls.count("timeout@example.test"), 1)
         self.assertIn("third@example.test", calls)
+
+    def test_transient_failures_stop_after_the_persisted_retry_limit(self):
+        campaign_id = database.create_campaign(["offline@example.test"], "Subject", "Body", [])
+        manager, calls = CampaignManager(), []
+
+        def fake_send(_, __, recipient, *args):
+            calls.append(recipient)
+            raise smtplib.SMTPServerDisconnected("forced disconnect")
+
+        with patch("email_worker.SMTPConnectionManager.send_message", new=fake_send):
+            threading.Thread(target=manager._worker, daemon=True).start()
+            manager.recipient_queue.put(database.queued_recipient_ids(campaign_id)[0])
+            manager.recipient_queue.join()
+            with database.connection() as db:
+                db.execute("UPDATE recipients SET status='queued',next_attempt_at=NULL WHERE campaign_id=?", (campaign_id,))
+            manager.recipient_queue.put(database.queued_recipient_ids(campaign_id)[0])
+            manager.recipient_queue.join()
+
+        campaign = database.get_campaign(campaign_id)
+        self.assertEqual(calls, ["offline@example.test", "offline@example.test"])
+        self.assertEqual((campaign["failed"], campaign["retrying"], campaign["status"]), (1, 0, "failed"))
+        with database.connection() as db:
+            self.assertEqual(db.execute("SELECT attempts FROM recipients WHERE campaign_id=?", (campaign_id,)).fetchone()[0], 2)
 
     def test_attachment_campaign_builds_and_sends_each_recipient(self):
         attachment = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
@@ -193,6 +216,45 @@ class CampaignFailureIsolationTest(unittest.TestCase):
         for invalid in ('Name <sender@example.test>', 'sender@example.test,other@example.test', 'sender@\nexample.test'):
             with self.assertRaises(ValueError):
                 normalized_smtp_username(invalid)
+
+    def test_recovery_pauses_interrupted_campaigns_without_touching_scheduled_campaigns(self):
+        interrupted_id = database.create_campaign(["sent@example.test", "interrupted@example.test"], "Subject", "Body", [])
+        future_id = database.create_campaign(
+            ["future@example.test"], "Subject", "Body", [],
+            scheduled_at="2999-01-01T00:00:00+00:00", timezone_name="UTC",
+        )
+        with database.connection() as db:
+            db.execute("UPDATE campaigns SET status='running' WHERE id=?", (interrupted_id,))
+            recipient_ids = [row[0] for row in db.execute("SELECT id FROM recipients WHERE campaign_id=? ORDER BY id", (interrupted_id,))]
+            db.execute("UPDATE recipients SET status='sent' WHERE id=?", (recipient_ids[0],))
+            db.execute("UPDATE recipients SET status='sending' WHERE id=?", (recipient_ids[1],))
+
+        recovered = database.recover_campaigns()
+
+        self.assertEqual(recovered, [interrupted_id])
+        self.assertEqual(database.get_campaign(interrupted_id)["status"], "paused")
+        self.assertEqual(database.queued_recipient_ids(interrupted_id), [recipient_ids[1]])
+        self.assertIsNone(database.claim_recipient(recipient_ids[1]))
+        with database.connection() as db:
+            self.assertEqual(db.execute("SELECT status FROM recipients WHERE id=?", (recipient_ids[0],)).fetchone()[0], "sent")
+        self.assertEqual(database.get_campaign(future_id)["status"], "scheduled")
+
+    def test_startup_does_not_enqueue_recovered_campaigns(self):
+        manager = CampaignManager()
+        with patch("email_worker.database.recover_campaigns", return_value=["old-campaign"]), \
+             patch("email_worker.threading.Thread"), \
+             patch.object(manager, "enqueue") as enqueue:
+            manager.start()
+        enqueue.assert_not_called()
+
+    def test_due_scheduled_campaign_is_still_activated_for_the_scheduler(self):
+        campaign_id = database.create_campaign(
+            ["scheduled@example.test"], "Subject", "Body", [],
+            scheduled_at="2000-01-01T00:00:00+00:00", timezone_name="UTC",
+        )
+
+        self.assertEqual(database.activate_due_campaigns(), [campaign_id])
+        self.assertEqual(database.get_campaign(campaign_id)["status"], "queued")
 
 
 if __name__ == "__main__":

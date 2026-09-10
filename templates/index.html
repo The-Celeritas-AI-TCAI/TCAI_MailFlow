@@ -144,14 +144,17 @@
                 </div>
 
                 <div class="step-heading">
-                    <h2>Upload Contacts</h2>
+                    <h2>Recipients</h2>
                     <p>
-                        Import a PDF, CSV, or Excel file containing your contacts.
+                        Fetch recipients from your database. File import remains available as a legacy option.
                     </p>
                 </div>
 
             </div>
 
+
+            <button type="button" id="fetchSupabaseBtn" class="btn primary full-width">Fetch Recipients from Database</button>
+            <p class="source-note"></p>
 
             <form id="uploadForm">
 
@@ -229,7 +232,7 @@
                         </svg>
                     </span>
 
-                    Upload & Extract Emails
+                    Or Upload & Extract Contacts
                 </button>
 
             </form>
@@ -281,18 +284,15 @@
                         </p>
                     </div>
 
-                    <span class="preview-badge">
-                        READ ONLY
-                    </span>
+                    <span class="preview-badge" id="recipientCount">0 RECIPIENTS</span>
 
                 </div>
 
-                <textarea
-                    id="emailPreview"
-                    rows="8"
-                    readonly
-                    spellcheck="false"
-                ></textarea>
+                <div class="recipient-tools">
+                    <input id="emailSearch" type="search" placeholder="Search extracted emails" autocomplete="off" aria-label="Search extracted emails">
+                    <button type="button" id="discardSelectedBtn" class="text-action" disabled>Discard Selected</button>
+                </div>
+                <div id="emailPreview" class="recipient-list" aria-live="polite"></div>
 
             </div>
 
@@ -422,6 +422,11 @@
                     <input type="time" id="scheduleTime" aria-label="Schedule time">
                     <input type="text" id="scheduleTimezone" value="Asia/Kolkata" aria-label="Timezone">
                 </div>
+                <div class="schedule-fields pause-fields">
+                    <input type="number" id="automaticPauseAfter" min="0" step="1" value="0" aria-label="Pause after emails" placeholder="Pause after emails (0 disables)">
+                    <input type="number" id="automaticPauseMinutes" min="0" step="1" value="0" aria-label="Pause duration in minutes" placeholder="Pause duration (minutes)">
+                </div>
+                <p class="source-note">Set both pause values to automatically pause after each sending cycle; use 0 and 0 to disable it.</p>
                 <div class="compose-actions">
                     <button type="button" id="resetScheduleBtn" class="text-action">Reset Schedule</button>
                     <button type="button" id="resetFormBtn" class="text-action">Reset Form</button>
@@ -493,6 +498,10 @@
             </button>
 
             <button type="button" id="cancelBtn" class="btn full-width hidden">Cancel Campaign</button>
+            <div class="compose-actions" id="campaignControls">
+                <button type="button" id="pauseBtn" class="text-action hidden">Pause</button>
+                <button type="button" id="resumeBtn" class="text-action hidden">Resume</button>
+            </div>
 
 
             <div
