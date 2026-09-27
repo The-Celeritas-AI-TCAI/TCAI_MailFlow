@@ -100,6 +100,12 @@ def init_database():
                 last_error TEXT,
                 sent_at TEXT,
                 next_attempt_at TEXT,
+                started_at TEXT,
+                failed_at TEXT,
+                smtp_code TEXT,
+                elapsed_seconds REAL,
+                message_size INTEGER,
+                logs TEXT,
                 FOREIGN KEY(campaign_id)
                     REFERENCES campaigns(id)
                     ON DELETE CASCADE
@@ -125,6 +131,60 @@ def init_database():
                     REFERENCES campaigns(id)
                     ON DELETE CASCADE
             );
+
+            /* The recipients table remains the current worker queue.  This
+               ledger preserves each immutable campaign iteration. */
+            CREATE TABLE IF NOT EXISTS campaign_iterations (
+                campaign_id TEXT NOT NULL,
+                iteration_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                started_at TEXT,
+                completed_at TEXT,
+                PRIMARY KEY (campaign_id, iteration_number),
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS recipient_iteration_results (
+                campaign_id TEXT NOT NULL,
+                recipient_id INTEGER NOT NULL,
+                iteration_number INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                first_attempt_at TEXT,
+                last_attempt_at TEXT,
+                sent_at TEXT,
+                failed_at TEXT,
+                failure_stage TEXT,
+                error_type TEXT,
+                error_message TEXT,
+                smtp_response_code TEXT,
+                smtp_response TEXT,
+                elapsed_seconds REAL,
+                message_size INTEGER,
+                logs TEXT,
+                PRIMARY KEY (campaign_id, recipient_id, iteration_number),
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE,
+                FOREIGN KEY(recipient_id) REFERENCES recipients(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_iteration_results_queue
+            ON recipient_iteration_results(campaign_id, iteration_number, status, recipient_id);
+
+            CREATE TABLE IF NOT EXISTS campaign_event_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                campaign_id TEXT NOT NULL,
+                recipient_id INTEGER,
+                iteration_number INTEGER NOT NULL DEFAULT 1,
+                occurred_at TEXT NOT NULL,
+                event TEXT NOT NULL,
+                status TEXT,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                details TEXT,
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE,
+                FOREIGN KEY(recipient_id) REFERENCES recipients(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_campaign_events_order
+            ON campaign_event_log(campaign_id, iteration_number, id);
             """
         )
 
@@ -151,6 +211,15 @@ def init_database():
 
             "sent_since_pause":
                 "INTEGER NOT NULL DEFAULT 0",
+
+            "current_iteration":
+                "INTEGER NOT NULL DEFAULT 1",
+
+            "total_iterations":
+                "INTEGER NOT NULL DEFAULT 1",
+            "paused_at": "TEXT",
+            "resumed_at": "TEXT",
+            "next_run_at": "TEXT",
         }
 
         for column, definition in campaign_migrations.items():
@@ -173,12 +242,35 @@ def init_database():
             )
         }
 
-        if "next_attempt_at" not in recipient_columns:
+        recipient_migrations = {
+            "next_attempt_at": "TEXT", "started_at": "TEXT", "failed_at": "TEXT",
+            "smtp_code": "TEXT", "elapsed_seconds": "REAL", "message_size": "INTEGER",
+            "logs": "TEXT",
+        }
+        for column, definition in recipient_migrations.items():
+            if column not in recipient_columns:
+                db.execute(f"ALTER TABLE recipients ADD COLUMN {column} {definition}")
 
-            db.execute(
-                "ALTER TABLE recipients "
-                "ADD COLUMN next_attempt_at TEXT"
-            )
+        result_columns = {row[1] for row in db.execute("PRAGMA table_info(recipient_iteration_results)")}
+        for column, definition in {"elapsed_seconds": "REAL", "message_size": "INTEGER", "logs": "TEXT"}.items():
+            if column not in result_columns:
+                db.execute(f"ALTER TABLE recipient_iteration_results ADD COLUMN {column} {definition}")
+
+        # Backfill the ledger for every existing campaign without changing its
+        # queue rows or historical delivery state.
+        db.execute("""
+            INSERT OR IGNORE INTO campaign_iterations
+                (campaign_id, iteration_number, status, started_at, completed_at)
+            SELECT id, 1, status, started_at, completed_at FROM campaigns
+        """)
+        db.execute("""
+            INSERT OR IGNORE INTO recipient_iteration_results
+                (campaign_id, recipient_id, iteration_number, status,
+                 attempt_count, sent_at, error_message, failed_at)
+            SELECT campaign_id, id, 1, status, attempts, sent_at, last_error,
+                   CASE WHEN status='failed' THEN NULL ELSE NULL END
+            FROM recipients
+        """)
 
         # --------------------------------------------------------------
         # ATTACHMENT MIGRATION
@@ -249,6 +341,7 @@ def create_campaign(
     campaign_id=None,
     automatic_pause_after=0,
     automatic_pause_minutes=0,
+    total_iterations=1,
 ):
     """
     Create a completely isolated campaign.
@@ -297,6 +390,8 @@ def create_campaign(
         seen.add(email_key)
         normalized_emails.append(email)
 
+    total_iterations = max(1, int(total_iterations or 1))
+
     with connection() as db:
 
         # ----------------------------------------------------------
@@ -315,10 +410,12 @@ def create_campaign(
                 subject,
                 body,
                 automatic_pause_after,
-                automatic_pause_minutes
+                automatic_pause_minutes,
+                current_iteration,
+                total_iterations
             )
             VALUES (
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -332,6 +429,8 @@ def create_campaign(
                 body,
                 automatic_pause_after,
                 automatic_pause_minutes,
+                1,
+                total_iterations,
             ),
         )
 
@@ -368,6 +467,20 @@ def create_campaign(
                     for email in normalized_emails
                 ],
             )
+
+        db.execute(
+            "INSERT INTO campaign_iterations (campaign_id, iteration_number, status) VALUES (?, 1, ?)",
+            (campaign_id, "scheduled" if scheduled_at else "queued"),
+        )
+        db.execute("""
+            INSERT INTO recipient_iteration_results
+                (campaign_id, recipient_id, iteration_number, status)
+            SELECT campaign_id, id, 1, status FROM recipients WHERE campaign_id=?
+        """, (campaign_id,))
+        _log_event(db, campaign_id, "CAMPAIGN_CREATED",
+                   "scheduled" if scheduled_at else "queued",
+                   details="Campaign scheduled" if scheduled_at else "Campaign queued",
+                   occurred_at=created_at)
 
         # ----------------------------------------------------------
         # ATTACHMENTS
@@ -495,6 +608,12 @@ def get_campaign(
                     + counts.get("sending", 0)
                 ),
                 "attachments": attachment_list,
+                "current_recipient": next((
+                    row[0] for row in db.execute(
+                        "SELECT email FROM recipients WHERE campaign_id=? AND status='sending' ORDER BY id LIMIT 1",
+                        (campaign_id,),
+                    )
+                ), None),
             }
         )
 
@@ -573,6 +692,57 @@ def list_campaigns():
     ]
 
 
+def iteration_results(campaign_id, iteration_number=None):
+    """Return report rows from the immutable iteration ledger."""
+    with connection() as db:
+        campaign = db.execute("SELECT * FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+        if not campaign:
+            return None, []
+        iteration_number = iteration_number or campaign["current_iteration"]
+        rows = [dict(row) for row in db.execute("""
+            SELECT r.email AS recipient_email, r.id AS recipient_id,
+                   ir.iteration_number, ir.status, ir.attempt_count,
+                   ir.first_attempt_at, ir.last_attempt_at, ir.sent_at,
+                   ir.failed_at, ir.failure_stage, ir.error_type,
+                   ir.error_message, ir.smtp_response_code, ir.smtp_response,
+                   ir.elapsed_seconds, c.name AS campaign_name
+            FROM recipient_iteration_results ir
+            JOIN recipients r ON r.id=ir.recipient_id
+            JOIN campaigns c ON c.id=ir.campaign_id
+            WHERE ir.campaign_id=? AND ir.iteration_number=?
+            ORDER BY r.id
+        """, (campaign_id, iteration_number))]
+        events = [dict(row) for row in db.execute("""
+            SELECT e.occurred_at, c.name AS campaign_name, e.campaign_id,
+                   r.email AS recipient_email, e.iteration_number, e.event,
+                   e.status, e.attempt, e.retry_count, e.details
+            FROM campaign_event_log e
+            JOIN campaigns c ON c.id=e.campaign_id
+            LEFT JOIN recipients r ON r.id=e.recipient_id
+            WHERE e.campaign_id=? AND e.iteration_number=?
+            ORDER BY e.id
+        """, (campaign_id, iteration_number))]
+        campaign = dict(campaign)
+        campaign["last_updated"] = db.execute(
+            "SELECT MAX(occurred_at) FROM campaign_event_log WHERE campaign_id=?", (campaign_id,)
+        ).fetchone()[0] or campaign.get("created_at")
+        campaign["events"] = events
+    return dict(campaign), rows
+
+
+def _log_event(db, campaign_id, event, status=None, recipient_id=None,
+               iteration=None, attempt=0, retry_count=0, details=None, occurred_at=None):
+    """Append a compact delivery audit event in the state-changing transaction."""
+    if iteration is None:
+        row = db.execute("SELECT current_iteration FROM campaigns WHERE id=?", (campaign_id,)).fetchone()
+        iteration = row[0] if row else 1
+    db.execute("""INSERT INTO campaign_event_log
+        (campaign_id, recipient_id, iteration_number, occurred_at, event, status,
+         attempt, retry_count, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (campaign_id, recipient_id, iteration, occurred_at or now(), event, status,
+         attempt, retry_count, details))
+
+
 def activate_due_campaigns():
     """Move scheduled campaigns into queued state."""
 
@@ -642,6 +812,13 @@ def recover_campaigns():
               )
             """
         )
+        db.execute("""
+            UPDATE recipient_iteration_results
+            SET status='queued'
+            WHERE status='sending' AND campaign_id IN (
+                SELECT id FROM campaigns WHERE status IN ('queued','running','resuming','auto_paused')
+            )
+        """)
 
         rows = db.execute(
             """
@@ -700,7 +877,8 @@ def queued_recipient_ids(campaign_id):
               AND c.status IN (
                   'queued',
                   'running',
-                  'resuming'
+                  'resuming',
+                  'paused'
               )
               AND c.cancellation_requested=0
             ORDER BY r.id
@@ -808,6 +986,29 @@ def claim_recipient(
         # ATOMIC CLAIM
         # ----------------------------------------------------------
 
+        # The iteration ledger is part of the atomic claim.  A stale queue
+        # entry can therefore never claim a recipient already sent in this
+        # iteration, even when more than one worker is active.
+        iteration = db.execute(
+            "SELECT current_iteration FROM campaigns WHERE id=?",
+            (row["campaign_id"],),
+        ).fetchone()["current_iteration"]
+        # Keep compatibility with administrative recovery tools that reset an
+        # already-due retry to queued directly in the legacy queue table.
+        db.execute("""
+            UPDATE recipient_iteration_results SET status='queued'
+            WHERE campaign_id=? AND recipient_id=? AND iteration_number=?
+              AND status='retrying' AND ? IS NULL
+        """, (row["campaign_id"], recipient_id, iteration, row["next_attempt_at"]))
+        ledger = db.execute("""
+            UPDATE recipient_iteration_results
+            SET status='sending'
+            WHERE campaign_id=? AND recipient_id=? AND iteration_number=?
+              AND status='queued'
+        """, (row["campaign_id"], recipient_id, iteration)).rowcount
+        if ledger != 1:
+            return None
+
         updated = db.execute(
             """
             UPDATE recipients
@@ -825,6 +1026,11 @@ def claim_recipient(
         ).rowcount
 
         if updated != 1:
+            db.execute("""
+                UPDATE recipient_iteration_results SET status='queued'
+                WHERE campaign_id=? AND recipient_id=? AND iteration_number=?
+                  AND status='sending'
+            """, (row["campaign_id"], recipient_id, iteration))
             return None
 
         # ----------------------------------------------------------
@@ -852,7 +1058,13 @@ def claim_recipient(
             ),
         )
 
-        return dict(row)
+        _log_event(db, row["campaign_id"], "SEND_STARTED", "sending",
+                   recipient_id, iteration, row["attempts"], max(0, row["attempts"] - 1),
+                   "Recipient claimed by worker")
+
+        claimed = dict(row)
+        claimed["iteration_number"] = iteration
+        return claimed
 
 
 def record_attempt(recipient_id):
@@ -860,14 +1072,15 @@ def record_attempt(recipient_id):
 
     with connection() as db:
 
+        attempt_at = now()
         db.execute(
             """
             UPDATE recipients
-            SET attempts=attempts+1
+            SET attempts=attempts+1, started_at=COALESCE(started_at, ?)
             WHERE id=?
               AND status='sending'
             """,
-            (recipient_id,),
+            (attempt_at, recipient_id),
         )
 
         row = db.execute(
@@ -878,6 +1091,23 @@ def record_attempt(recipient_id):
             """,
             (recipient_id,),
         ).fetchone()
+
+        if row:
+            campaign = db.execute(
+                "SELECT campaign_id FROM recipients WHERE id=?", (recipient_id,)
+            ).fetchone()
+            iteration = db.execute(
+                "SELECT current_iteration FROM campaigns WHERE id=?", (campaign["campaign_id"],)
+            ).fetchone()["current_iteration"]
+            db.execute("""
+                UPDATE recipient_iteration_results
+                SET attempt_count=?, first_attempt_at=COALESCE(first_attempt_at, ?),
+                    last_attempt_at=?
+                WHERE campaign_id=? AND recipient_id=? AND iteration_number=?
+            """, (row["attempts"], attempt_at, attempt_at, campaign["campaign_id"], recipient_id, iteration))
+            _log_event(db, campaign["campaign_id"], "ATTEMPT_STARTED", "sending",
+                       recipient_id, iteration, row["attempts"], max(0, row["attempts"] - 1),
+                       "SMTP attempt started", attempt_at)
 
     return (
         row["attempts"]
@@ -958,11 +1188,16 @@ def recipient_result(
     recipient_id,
     status,
     error=None,
+    smtp_code=None,
+    elapsed_seconds=None,
+    message_size=None,
+    logs=None,
 ):
     """Record final result for a recipient."""
 
     with connection() as db:
 
+        occurred_at = now()
         db.execute(
             """
             UPDATE recipients
@@ -970,13 +1205,23 @@ def recipient_result(
                 status=?,
                 last_error=?,
                 sent_at=?,
+                failed_at=?,
+                smtp_code=?,
+                elapsed_seconds=?,
+                message_size=?,
+                logs=?,
                 next_attempt_at=NULL
             WHERE id=?
             """,
             (
                 status,
                 error,
-                now() if status == "sent" else None,
+                occurred_at if status == "sent" else None,
+                occurred_at if status == "failed" else None,
+                str(smtp_code) if smtp_code is not None else None,
+                elapsed_seconds,
+                message_size,
+                logs,
                 recipient_id,
             ),
         )
@@ -994,15 +1239,37 @@ def recipient_result(
             return
 
         campaign_id = row["campaign_id"]
+        iteration = db.execute(
+            "SELECT current_iteration FROM campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()["current_iteration"]
+        db.execute("""
+            UPDATE recipient_iteration_results
+            SET status=?, sent_at=?, failed_at=?, error_message=?,
+                error_type=?, failure_stage=?, elapsed_seconds=?, message_size=?,
+                logs=?, smtp_response_code=COALESCE(?, smtp_response_code)
+            WHERE campaign_id=? AND recipient_id=? AND iteration_number=?
+              AND status='sending'
+        """, (
+            status, occurred_at if status == "sent" else None,
+            occurred_at if status == "failed" else None, error,
+            None, None, elapsed_seconds, message_size, logs,
+            str(smtp_code) if smtp_code is not None else None,
+            campaign_id, recipient_id, iteration,
+        ))
+        attempt_row = db.execute("""SELECT attempt_count FROM recipient_iteration_results
+            WHERE campaign_id=? AND recipient_id=? AND iteration_number=?""",
+            (campaign_id, recipient_id, iteration)).fetchone()
+        attempt_count = attempt_row[0] if attempt_row else 0
+        _log_event(db, campaign_id, "SEND_SUCCESS" if status == "sent" else "FINAL_FAILED",
+                   status, recipient_id, iteration, attempt_count, max(0, attempt_count - 1),
+                   error or ("SMTP accepted message" if status == "sent" else "Final send failure"), occurred_at)
 
     if status == "sent":
         _maybe_start_automatic_pause(
             campaign_id
         )
 
-    refresh_campaign_status(
-        campaign_id
-    )
+    refresh_campaign_status(campaign_id)
 
 
 def schedule_retry(
@@ -1050,6 +1317,18 @@ def schedule_retry(
         )
 
         campaign_id = row["campaign_id"]
+        iteration = db.execute("SELECT current_iteration FROM campaigns WHERE id=?", (campaign_id,)).fetchone()["current_iteration"]
+        db.execute("""
+            UPDATE recipient_iteration_results
+            SET status='retrying', error_message=?
+            WHERE campaign_id=? AND recipient_id=? AND iteration_number=? AND status='sending'
+        """, (error, campaign_id, recipient_id, iteration))
+        attempt_row = db.execute("""SELECT attempt_count FROM recipient_iteration_results
+            WHERE campaign_id=? AND recipient_id=? AND iteration_number=?""",
+            (campaign_id, recipient_id, iteration)).fetchone()
+        attempt_count = attempt_row[0] if attempt_row else 0
+        _log_event(db, campaign_id, "SMTP_FAILURE", "retrying", recipient_id,
+                   iteration, attempt_count, max(0, attempt_count - 1), error)
 
     refresh_campaign_status(
         campaign_id
@@ -1154,7 +1433,9 @@ def refresh_campaign_status(
             """
             SELECT
                 status,
-                cancellation_requested
+                cancellation_requested,
+                current_iteration,
+                total_iterations
             FROM campaigns
             WHERE id=?
             """,
@@ -1233,6 +1514,35 @@ def refresh_campaign_status(
             status = "completed"
             complete = now()
 
+        # An iteration is complete only after every current queue row is
+        # terminal.  Preserve that ledger and initialise the next iteration
+        # from the same stable recipient IDs in original insertion order.
+        current_iteration = campaign["current_iteration"] if "current_iteration" in campaign.keys() else 1
+        total_iterations = campaign["total_iterations"] if "total_iterations" in campaign.keys() else 1
+        if not pending and not campaign["cancellation_requested"]:
+            db.execute("""
+                UPDATE campaign_iterations SET status=?, completed_at=?
+                WHERE campaign_id=? AND iteration_number=?
+            """, (status, complete, campaign_id, current_iteration))
+            if current_iteration < total_iterations:
+                next_iteration = current_iteration + 1
+                db.execute("""
+                    INSERT OR IGNORE INTO campaign_iterations
+                        (campaign_id, iteration_number, status)
+                    VALUES (?, ?, 'queued')
+                """, (campaign_id, next_iteration))
+                db.execute("""
+                    INSERT OR IGNORE INTO recipient_iteration_results
+                        (campaign_id, recipient_id, iteration_number, status)
+                    SELECT campaign_id, id, ?, 'queued' FROM recipients WHERE campaign_id=?
+                """, (next_iteration, campaign_id))
+                db.execute("""
+                    UPDATE recipients SET status='queued', attempts=0, last_error=NULL,
+                        sent_at=NULL, next_attempt_at=NULL WHERE campaign_id=?
+                """, (campaign_id,))
+                status, complete = 'queued', None
+                db.execute("UPDATE campaigns SET current_iteration=? WHERE id=?", (next_iteration, campaign_id))
+
         db.execute(
             """
             UPDATE campaigns
@@ -1283,6 +1593,13 @@ def cancel_campaign(
                 """,
                 (campaign_id,),
             )
+            db.execute("""
+                UPDATE recipient_iteration_results
+                SET status='cancelled', error_message='Campaign cancelled'
+                WHERE campaign_id=? AND iteration_number=(
+                    SELECT current_iteration FROM campaigns WHERE id=?
+                ) AND status IN ('queued','retrying')
+            """, (campaign_id, campaign_id))
 
             db.execute(
                 """
@@ -1365,6 +1682,13 @@ def fail_campaign_configuration(
                 campaign_id,
             ),
         )
+        db.execute("""
+            UPDATE recipient_iteration_results
+            SET status='failed', error_message=?, failed_at=?
+            WHERE campaign_id=? AND iteration_number=(
+                SELECT current_iteration FROM campaigns WHERE id=?
+            ) AND status IN ('queued','sending','retrying')
+        """, (error, now(), campaign_id, campaign_id))
 
 
 def retry_failed_campaign(
@@ -1470,6 +1794,8 @@ def pause_campaign(
                 """,
                 (campaign_id,),
             )
+            _log_event(db, campaign_id, "CAMPAIGN_PAUSED", "paused",
+                       details="Campaign pause requested")
 
     return get_campaign(
         campaign_id
@@ -1513,6 +1839,8 @@ def resume_campaign(
                 """,
                 (campaign_id,),
             )
+            _log_event(db, campaign_id, "CAMPAIGN_RESUMED", "resuming",
+                       details="Campaign resume requested")
 
     return get_campaign(
         campaign_id
@@ -1555,6 +1883,13 @@ def activate_due_retries_and_resumes():
             """,
             (current_time,),
         )
+        db.execute("""
+            UPDATE recipient_iteration_results
+            SET status='queued'
+            WHERE status='retrying' AND campaign_id IN (
+                SELECT id FROM campaigns WHERE status IN ('queued','running','resuming')
+            )
+        """)
 
         # ----------------------------------------------------------
         # AUTOMATIC RESUME

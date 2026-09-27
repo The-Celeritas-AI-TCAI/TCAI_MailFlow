@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pdfplumber
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 
@@ -17,6 +17,7 @@ import database
 from config import Config
 from email_worker import campaign_manager, estimate_message_size
 from supabase_recipients import SupabaseRecipientError, fetch_recipient_emails
+from reporting import build_report
 
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -162,6 +163,16 @@ def parse_pause_settings():
     return after, minutes
 
 
+def parse_iterations():
+    try:
+        iterations = int(request.form.get("total_iterations", "1") or 1)
+    except ValueError:
+        raise ValueError("Iterations must be a whole number.")
+    if iterations < 1:
+        raise ValueError("Iterations must be at least 1.")
+    return iterations
+
+
 @app.route("/")
 def index(): return render_template("index.html")
 
@@ -206,10 +217,10 @@ def send_emails():
         if not emails: return jsonify(success=False, message="No valid email addresses were found."), 400
         if not subject or not body: return jsonify(success=False, message="Subject and email body are required."), 400
         campaign_id = str(uuid.uuid4()); attachments = save_attachments(campaign_id); estimated_size = estimate_message_size(body, attachments)
-        if estimated_size > Config.SMTP_MAX_MESSAGE_SIZE:
-            raise ValueError(f"Estimated email size ({estimated_size / 1024 / 1024:.2f} MB) exceeds the configured SMTP limit ({Config.SMTP_MAX_MESSAGE_SIZE / 1024 / 1024:.2f} MB).")
-        scheduled_at, timezone_name = parse_schedule(); pause_after, pause_minutes = parse_pause_settings()
-        campaign_id = database.create_campaign(emails, subject, body, attachments, scheduled_at, timezone_name, request.form.get("campaign_name", "").strip() or None, campaign_id, pause_after, pause_minutes)
+        # Exact personalised MIME size is checked per recipient by the worker.
+        # This estimate is returned to the UI only, not used to discard audit data.
+        scheduled_at, timezone_name = parse_schedule(); pause_after, pause_minutes = parse_pause_settings(); total_iterations = parse_iterations()
+        campaign_id = database.create_campaign(emails, subject, body, attachments, scheduled_at, timezone_name, request.form.get("campaign_name", "").strip() or None, campaign_id, pause_after, pause_minutes, total_iterations)
         if not scheduled_at: campaign_manager.enqueue(campaign_id)
         campaign = database.get_campaign(campaign_id)
         return jsonify(success=True, message="Campaign scheduled." if scheduled_at else "Campaign accepted and queued.", campaign_id=campaign_id, estimated_email_size=estimated_size, **campaign), 202
@@ -231,6 +242,21 @@ def send_emails():
 def campaign_status(campaign_id):
     campaign = database.get_campaign(campaign_id)
     return (jsonify(success=True, campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
+
+
+@app.route("/campaign/<campaign_id>/report")
+def campaign_report(campaign_id):
+    raw_iteration = request.args.get("iteration")
+    try:
+        iteration = int(raw_iteration) if raw_iteration else None
+    except ValueError:
+        return jsonify(success=False, message="Iteration must be a whole number."), 400
+    final = request.args.get("final") in ("1", "true")
+    stream, filename = build_report(campaign_id, iteration, final)
+    if stream is None:
+        return jsonify(success=False, message="Campaign not found."), 404
+    return send_file(stream, as_attachment=True, download_name=filename,
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 @app.route("/campaigns")

@@ -93,6 +93,12 @@ class Config:
         int(os.getenv("SMTP_TIMEOUT", "30")),
     )
 
+    # Preferred explicit operation timeout; SMTP_TIMEOUT remains supported.
+    SMTP_OPERATION_TIMEOUT = max(
+        5,
+        int(os.getenv("SMTP_OPERATION_TIMEOUT", str(SMTP_TIMEOUT))),
+    )
+
     # SMTP DATA timeout.
     #
     # IMPORTANT:
@@ -102,8 +108,17 @@ class Config:
     # This allows larger messages or slower temporary network conditions
     # without killing a healthy transfer.
     SMTP_ATTACHMENT_TIMEOUT = max(
-        SMTP_TIMEOUT,
-        int(os.getenv("SMTP_ATTACHMENT_TIMEOUT", "300")),
+        SMTP_OPERATION_TIMEOUT,
+        int(os.getenv("SMTP_DATA_TIMEOUT", os.getenv("SMTP_ATTACHMENT_TIMEOUT", "300"))),
+    )
+    SMTP_DATA_TIMEOUT = SMTP_ATTACHMENT_TIMEOUT
+
+    # Check a reused connection only after it has been idle this long.  This
+    # avoids a round-trip NOOP before every sequential recipient while finding
+    # provider-closed idle sockets before MAIL FROM. Set 0 to disable.
+    SMTP_HEALTH_CHECK_IDLE = max(
+        0.0,
+        float(os.getenv("SMTP_HEALTH_CHECK_IDLE", "30")),
     )
 
     # Maximum generated MIME message size.

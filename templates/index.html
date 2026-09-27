@@ -426,6 +426,11 @@
                     <input type="number" id="automaticPauseAfter" min="0" step="1" value="0" aria-label="Pause after emails" placeholder="Pause after emails (0 disables)">
                     <input type="number" id="automaticPauseMinutes" min="0" step="1" value="0" aria-label="Pause duration in minutes" placeholder="Pause duration (minutes)">
                 </div>
+                <div class="form-group">
+                    <label for="totalIterations">Email iterations</label>
+                    <input type="number" id="totalIterations" min="1" step="1" value="1" aria-label="Total email iterations">
+                    <p class="source-note">Each recipient receives at most one email per iteration.</p>
+                </div>
                 <p class="source-note">Set both pause values to automatically pause after each sending cycle; use 0 and 0 to disable it.</p>
                 <div class="compose-actions">
                     <button type="button" id="resetScheduleBtn" class="text-action">Reset Schedule</button>
@@ -502,6 +507,7 @@
                 <button type="button" id="pauseBtn" class="text-action hidden">Pause</button>
                 <button type="button" id="resumeBtn" class="text-action hidden">Resume</button>
             </div>
+            <a id="downloadReportBtn" class="btn full-width hidden" href="#">Download Current Excel Report</a>
 
 
             <div

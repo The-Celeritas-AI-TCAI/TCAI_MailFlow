@@ -1,6 +1,7 @@
 """Background campaign workers, MIME construction, and SMTP lifecycle management."""
 
 import html
+import hashlib
 import logging
 import mimetypes
 import os
@@ -21,6 +22,9 @@ import database
 
 
 logger = logging.getLogger(__name__)
+
+
+SMTP_ATTACHMENT_TRANSPORT_VERSION = "attachment-data-fix-v1"
 
 
 class SMTPConfigurationError(ValueError):
@@ -172,6 +176,7 @@ class SMTPConnectionManager:
     def __init__(self):
         self.smtp = None
         self.stage = "CONNECT"
+        self.last_activity = None
 
     def connect(self):
         self.discard()
@@ -179,7 +184,7 @@ class SMTPConnectionManager:
         sender = Config.smtp_username()
 
         logger.info(
-            "[SMTP] connecting to configured server=%s port=%s",
+            "[SMTP] CONNECT server=%s port=%s",
             Config.SMTP_SERVER,
             Config.SMTP_PORT,
         )
@@ -237,6 +242,7 @@ class SMTPConnectionManager:
                 )
 
             self.smtp = smtp
+            self.last_activity = time.monotonic()
 
             logger.info(
                 "[PERF] SMTP connect=%.2fs TLS/EHLO=%.2fs login=%.2fs",
@@ -244,6 +250,7 @@ class SMTPConnectionManager:
                 tls_ready - connected,
                 time.monotonic() - tls_ready,
             )
+            logger.info("[SMTP] AUTHENTICATED")
 
             return smtp
 
@@ -270,7 +277,9 @@ class SMTPConnectionManager:
             OSError,
             socket.timeout,
         ):
-            self.disconnect()
+            # The peer is not usable; avoid a potentially blocking QUIT on a
+            # broken socket and let the next send authenticate a new session.
+            self.discard()
             return False
 
     def _set_socket_timeout(self, timeout):
@@ -295,6 +304,22 @@ class SMTPConnectionManager:
 
         if not self.smtp:
             self.connect()
+        elif (
+            Config.SMTP_HEALTH_CHECK_IDLE
+            and self.last_activity is not None
+            and time.monotonic() - self.last_activity
+            >= Config.SMTP_HEALTH_CHECK_IDLE
+        ):
+            logger.info("[SMTP] HEALTH_CHECK idle=%.2fs", time.monotonic() - self.last_activity)
+            if not self.is_connection_alive():
+                logger.info("[SMTP] RECONNECT_ATTEMPT reason=idle_connection_unusable")
+                self.connect()
+                logger.info("[SMTP] RECONNECT_SUCCESS")
+            else:
+                self.last_activity = time.monotonic()
+                logger.info("[SMTP] REUSE_CONNECTION")
+        else:
+            logger.info("[SMTP] REUSE_CONNECTION")
 
         data_timeout = (
             Config.SMTP_ATTACHMENT_TIMEOUT
@@ -360,7 +385,7 @@ class SMTPConnectionManager:
             self.stage = "DATA"
 
             logger.info(
-                "[SMTP] DATA start recipient=%s bytes=%s "
+                "[SMTP] SEND_START recipient=%s bytes=%s "
                 "timeout=%ss",
                 _redacted_recipient(recipient),
                 len(message_bytes),
@@ -391,6 +416,13 @@ class SMTPConnectionManager:
                     response,
                 )
 
+            self.last_activity = time.monotonic()
+            logger.info(
+                "[SMTP] SEND_SUCCESS recipient=%s data_elapsed=%.2fs",
+                _redacted_recipient(recipient),
+                data_elapsed,
+            )
+
         finally:
             # Always restore the normal command timeout.
             self._set_socket_timeout(
@@ -411,8 +443,10 @@ class SMTPConnectionManager:
                 pass
             finally:
                 self.smtp = None
+                self.last_activity = None
 
         self.stage = "DISCONNECTED"
+        logger.info("[SMTP] CONNECTION_CLOSED")
 
     def disconnect(self):
         """
@@ -607,6 +641,36 @@ class EmailMessageBuilder:
 
         return message
 
+    @staticmethod
+    def log_size_diagnostics(message, message_bytes, attachments):
+        """Log safe MIME accounting without exposing message content or secrets."""
+        plain_bytes = html_bytes = logo_bytes = attachment_encoded = 0
+        attachment_parts = list(message.iter_attachments())
+        for part in message.walk():
+            content_type = part.get_content_type()
+            payload = part.get_payload(decode=True) or b""
+            if content_type == "text/plain":
+                plain_bytes += len(payload)
+            elif content_type == "text/html":
+                html_bytes += len(payload)
+            elif part.get("Content-ID") and part.get_content_maintype() == "image":
+                logo_bytes += len(payload)
+        for part in attachment_parts:
+            encoded = part.get_payload(decode=False)
+            attachment_encoded += len(
+                encoded.encode("ascii", "replace") if isinstance(encoded, str) else encoded or b""
+            )
+
+        raw_total = sum(len(item["content"]) for item in attachments)
+        names = [item["filename"] for item in attachments]
+        logger.info(
+            "[MAIL SIZE] plain_body=%s html_body=%s logo=%s "
+            "attachment_raw=%s attachment_encoded=%s total_mime=%s "
+            "attachment_count=%s attachment_names=%s",
+            plain_bytes, html_bytes, logo_bytes, raw_total, attachment_encoded,
+            len(message_bytes), len(attachment_parts), names,
+        )
+
 
 class CampaignManager:
     def __init__(self):
@@ -634,6 +698,11 @@ class CampaignManager:
             return
 
         self.started = True
+
+        logger.info(
+            "[MAILFLOW] SMTP attachment transport version=%s",
+            SMTP_ATTACHMENT_TRANSPORT_VERSION,
+        )
 
         recovered_campaigns = (
             database.recover_campaigns()
@@ -714,9 +783,7 @@ class CampaignManager:
                         campaign_id
                     )
                 ):
-                    self.recipient_queue.put(
-                        recipient_id
-                    )
+                    self.recipient_queue.put((campaign_id, recipient_id))
 
             finally:
                 with self.lock:
@@ -773,16 +840,26 @@ class CampaignManager:
                         continue
 
                     try:
+                        stored_size = os.path.getsize(attachment["file_path"])
+                        if stored_size != attachment["size"]:
+                            raise RuntimeError(
+                                f"Attachment '{attachment['filename']}' size changed while queued"
+                            )
                         with open(
                             attachment["file_path"],
                             "rb",
                         ) as source:
-                            prepared.append(
-                                {
-                                    **attachment,
-                                    "content": source.read(),
-                                }
+                            content = source.read()
+                        if len(content) != attachment["size"]:
+                            raise RuntimeError(
+                                f"Attachment '{attachment['filename']}' was truncated while reading"
                             )
+                        logger.info(
+                            "[ATTACHMENT] filename=%s path=%s raw_bytes=%s mime_type=%s sha256=%s",
+                            attachment["filename"], attachment["file_path"], len(content),
+                            attachment.get("mime_type"), hashlib.sha256(content).hexdigest(),
+                        )
+                        prepared.append({**attachment, "content": content})
 
                     except OSError as exc:
                         raise RuntimeError(
@@ -854,8 +931,10 @@ class CampaignManager:
             exc,
             smtplib.SMTPRecipientsRefused,
         ):
+            details = next(iter(exc.recipients.values()), None)
+            code = details[0] if details else None
             return (
-                "Recipient rejected",
+                f"Recipient rejected (SMTP {code})" if code else "Recipient rejected",
                 False,
                 False,
             )
@@ -902,17 +981,22 @@ class CampaignManager:
             (
                 smtplib.SMTPServerDisconnected,
                 smtplib.SMTPConnectError,
-                socket.timeout,
-                TimeoutError,
-                ConnectionError,
-                OSError,
             ),
         ):
             return (
-                "SMTP connection lost or timed out",
+                "SMTP connection lost",
                 True,
                 False,
             )
+
+        if isinstance(exc, (socket.timeout, TimeoutError)):
+            return ("SMTP timeout", True, False)
+
+        if isinstance(exc, ConnectionRefusedError):
+            return ("SMTP connection refused", True, False)
+
+        if isinstance(exc, (ConnectionError, OSError)):
+            return ("SMTP network error", True, False)
 
         if isinstance(
             exc,
@@ -976,16 +1060,23 @@ class CampaignManager:
         )
 
         while True:
-            recipient_id = (
+            queued_item = (
                 self.recipient_queue.get()
             )
+            # Unit-test and legacy callers may still enqueue a bare recipient
+            # ID; normal dispatch always includes the campaign boundary.
+            if isinstance(queued_item, tuple):
+                queued_campaign_id, recipient_id = queued_item
+            else:
+                queued_campaign_id, recipient_id = None, queued_item
 
             claimed = None
 
             try:
                 claimed = (
                     database.claim_recipient(
-                        recipient_id
+                        recipient_id,
+                        queued_campaign_id,
                     )
                 )
 
@@ -1037,6 +1128,12 @@ class CampaignManager:
 
                 message_bytes = (
                     message.as_bytes()
+                )
+
+                builder.log_size_diagnostics(
+                    message,
+                    message_bytes,
+                    attachments,
                 )
 
                 build_elapsed = (

@@ -1,8 +1,10 @@
 import os
+import importlib.util
 import smtplib
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -14,9 +16,10 @@ dotenv_stub.load_dotenv = lambda: None
 sys.modules.setdefault("dotenv", dotenv_stub)
 
 import database
+from reporting import build_report
 from config import Config
 from config import normalized_smtp_username
-from email_worker import CampaignManager, SMTPConnectionManager
+from email_worker import CampaignManager, EmailMessageBuilder, ResilientSMTP, SMTPConnectionManager
 
 
 class CampaignFailureIsolationTest(unittest.TestCase):
@@ -27,10 +30,12 @@ class CampaignFailureIsolationTest(unittest.TestCase):
         self.original_retries = Config.MAX_EMAIL_RETRIES
         self.original_username = Config.SMTP_USERNAME
         self.original_password = Config.SMTP_PASSWORD
+        self.original_health_check_idle = Config.SMTP_HEALTH_CHECK_IDLE
         Config.DATABASE_URL = f"sqlite:///{self.temp_db.name}"
         Config.MAX_EMAIL_RETRIES = 1
         Config.SMTP_USERNAME = "sender@example.test"
         Config.SMTP_PASSWORD = "test-password"
+        Config.SMTP_HEALTH_CHECK_IDLE = 30
         database.init_database()
 
     def tearDown(self):
@@ -38,6 +43,7 @@ class CampaignFailureIsolationTest(unittest.TestCase):
         Config.MAX_EMAIL_RETRIES = self.original_retries
         Config.SMTP_USERNAME = self.original_username
         Config.SMTP_PASSWORD = self.original_password
+        Config.SMTP_HEALTH_CHECK_IDLE = self.original_health_check_idle
         # The daemon worker can briefly retain SQLite's Windows file handle after
         # queue.join(); a failed cleanup must not invalidate the behavior test.
         try:
@@ -199,6 +205,60 @@ class CampaignFailureIsolationTest(unittest.TestCase):
         self.assertEqual(connection.smtp.calls[0], ("MAIL_FROM", "sender@example.test", []))
         self.assertEqual([call[0] for call in connection.smtp.calls], ["MAIL_FROM", "RCPT_TO", "DATA"])
 
+    def test_idle_connection_is_checked_then_reused(self):
+        class FakeSMTP:
+            sock = None
+            def __init__(self): self.calls = []
+            def noop(self): self.calls.append("NOOP"); return 250, b"ok"
+            def has_extn(self, name): return False
+            def mail(self, sender, options=()): self.calls.append("MAIL_FROM"); return 250, b"ok"
+            def rcpt(self, recipient): self.calls.append("RCPT_TO"); return 250, b"ok"
+            def data(self, message): self.calls.append("DATA"); return 250, b"ok"
+
+        connection = SMTPConnectionManager()
+        connection.smtp = FakeSMTP()
+        connection.last_activity = time.monotonic() - 31
+        connection.send_message(b"message", "recipient@example.test")
+        self.assertEqual(connection.smtp.calls, ["NOOP", "MAIL_FROM", "RCPT_TO", "DATA"])
+
+    def test_attachment_mime_part_appears_once_and_round_trips_original_bytes(self):
+        attachment_bytes = os.urandom(100 * 1024)
+        builder = EmailMessageBuilder()
+        message = builder.build(
+            "sender@example.test", "recipient@example.test", "Subject", "Body",
+            [{"filename": "sample.bin", "content": attachment_bytes}],
+        )
+        parts = list(message.iter_attachments())
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0].get_filename(), "sample.bin")
+        self.assertEqual(parts[0].get_payload(decode=True), attachment_bytes)
+        self.assertEqual(parts[0]["Content-Transfer-Encoding"], "base64")
+        self.assertIn(b"MIME-Version: 1.0", message.as_bytes())
+
+    def test_attachment_size_threshold_mime_builds(self):
+        builder = EmailMessageBuilder()
+        for raw_size in (50 * 1024, 500 * 1024, 1024 * 1024):
+            raw = b"x" * raw_size
+            message = builder.build(
+                "sender@example.test", "recipient@example.test", "Subject", "Body",
+                [{"filename": "threshold.bin", "content": raw}],
+            )
+            serialized = message.as_bytes()
+            part = next(message.iter_attachments())
+            self.assertEqual(part.get_payload(decode=True), raw)
+            self.assertGreater(len(serialized), raw_size)
+
+    def test_resilient_smtp_chunks_large_data_writes(self):
+        class RecordingSocket:
+            def __init__(self): self.writes = []
+            def gettimeout(self): return 30
+            def send(self, data): self.writes.append(bytes(data)); return len(data)
+
+        smtp = ResilientSMTP.__new__(ResilientSMTP)
+        smtp.sock = RecordingSocket()
+        smtp.send(b"x" * (ResilientSMTP.TLS_WRITE_CHUNK_SIZE * 2 + 1))
+        self.assertEqual([len(write) for write in smtp.sock.writes], [65536, 65536, 1])
+
     def test_sender_rejection_is_identified_as_mail_from(self):
         class RejectingSMTP:
             sock = None
@@ -255,6 +315,69 @@ class CampaignFailureIsolationTest(unittest.TestCase):
 
         self.assertEqual(database.activate_due_campaigns(), [campaign_id])
         self.assertEqual(database.get_campaign(campaign_id)["status"], "queued")
+
+    def test_resume_and_iteration_history_are_database_backed(self):
+        campaign_id = database.create_campaign(
+            ["one@example.test", "two@example.test", "three@example.test"],
+            "Subject", "Body", [], total_iterations=2,
+        )
+        ids = database.queued_recipient_ids(campaign_id)
+        for recipient_id in ids[:2]:
+            self.assertIsNotNone(database.claim_recipient(recipient_id, campaign_id))
+            database.record_attempt(recipient_id)
+            database.recipient_result(recipient_id, "sent")
+        database.pause_campaign(campaign_id)
+        self.assertEqual(database.get_campaign(campaign_id)["sent"], 2)
+        database.resume_campaign(campaign_id)
+        self.assertEqual(database.queued_recipient_ids(campaign_id), [ids[2]])
+        self.assertIsNotNone(database.claim_recipient(ids[2], campaign_id))
+        database.record_attempt(ids[2])
+        database.recipient_result(ids[2], "sent")
+        campaign = database.get_campaign(campaign_id)
+        self.assertEqual((campaign["current_iteration"], campaign["status"], campaign["queued"]), (2, "queued", 3))
+        first_iteration = database.iteration_results(campaign_id, 1)[1]
+        self.assertEqual([row["status"] for row in first_iteration], ["sent", "sent", "sent"])
+
+    def test_iteration_ledger_prevents_second_success(self):
+        campaign_id = database.create_campaign(["one@example.test"], "Subject", "Body", [])
+        recipient_id = database.queued_recipient_ids(campaign_id)[0]
+        self.assertIsNotNone(database.claim_recipient(recipient_id, campaign_id))
+        database.record_attempt(recipient_id)
+        database.recipient_result(recipient_id, "sent")
+        self.assertIsNone(database.claim_recipient(recipient_id, campaign_id))
+
+    @unittest.skipUnless(importlib.util.find_spec("openpyxl"), "openpyxl is installed with application dependencies")
+    def test_iteration_report_builds_xlsx(self):
+        campaign_id = database.create_campaign(["one@example.test"], "Subject", "Body", [])
+        stream, filename = build_report(campaign_id, 1)
+        self.assertTrue(filename.endswith("Iteration_1.xlsx"))
+        self.assertGreater(len(stream.read()), 100)
+
+    @unittest.skipUnless(importlib.util.find_spec("openpyxl"), "openpyxl is installed with application dependencies")
+    def test_report_contains_recipient_audit_sheets_and_ist_timestamps(self):
+        from openpyxl import load_workbook
+
+        campaign_id = database.create_campaign(["sent@example.test", "failed@example.test"], "Subject", "Body", [])
+        recipient_ids = database.queued_recipient_ids(campaign_id)
+        for recipient_id, status, error in ((recipient_ids[0], "sent", None),
+                                             (recipient_ids[1], "failed", "SMTP connection lost")):
+            database.claim_recipient(recipient_id, campaign_id)
+            database.record_attempt(recipient_id)
+            database.recipient_result(recipient_id, status, error=error)
+
+        stream, _ = build_report(campaign_id, 1)
+        workbook = load_workbook(stream, read_only=True, data_only=True)
+        self.assertEqual(workbook.sheetnames, ["Campaign Summary", "Recipient Results", "Event Log"])
+        summary = workbook["Campaign Summary"]
+        self.assertEqual(summary.max_column, 15)
+        recipients = workbook["Recipient Results"]
+        self.assertEqual(recipients.max_row, 3)
+        values = list(recipients.values)
+        self.assertEqual([values[1][6], values[2][6]], ["SENT", "FAILED"])
+        self.assertIn("PM IST", values[1][9])
+        self.assertEqual(values[2][15], "SMTP_CONNECTION_LOST")
+        self.assertGreater(workbook["Event Log"].max_row, 2)
+        workbook.close()
 
 
 if __name__ == "__main__":
