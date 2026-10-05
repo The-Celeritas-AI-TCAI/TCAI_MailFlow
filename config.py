@@ -221,6 +221,11 @@ class Config:
         float(os.getenv("EMAIL_RATE_LIMIT", "0")),
     )
 
+    EMAIL_INTERVAL_SECONDS = max(
+        0.0,
+        float(os.getenv("EMAIL_INTERVAL_SECONDS", "30")),
+    )
+
     # ------------------------------------------------------------------
     # SCHEDULER / DATABASE
     # ------------------------------------------------------------------

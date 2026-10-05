@@ -318,8 +318,11 @@ class SMTPConnectionManager:
             else:
                 self.last_activity = time.monotonic()
                 logger.info("[SMTP] REUSE_CONNECTION")
+
         else:
             logger.info("[SMTP] REUSE_CONNECTION")
+
+        campaign_id = getattr(self, "campaign_id", None)
 
         data_timeout = (
             Config.SMTP_ATTACHMENT_TIMEOUT
@@ -385,8 +388,9 @@ class SMTPConnectionManager:
             self.stage = "DATA"
 
             logger.info(
-                "[SMTP] SEND_START recipient=%s bytes=%s "
+                "[SMTP] campaign=%s recipient=%s SEND_START bytes=%s "
                 "timeout=%ss",
+                campaign_id,
                 _redacted_recipient(recipient),
                 len(message_bytes),
                 data_timeout,
@@ -403,8 +407,9 @@ class SMTPConnectionManager:
             )
 
             logger.info(
-                "[SMTP] DATA complete recipient=%s "
+                "[SMTP] campaign=%s recipient=%s DATA_END "
                 "elapsed=%.2fs code=%s",
+                campaign_id,
                 _redacted_recipient(recipient),
                 data_elapsed,
                 code,
@@ -418,7 +423,8 @@ class SMTPConnectionManager:
 
             self.last_activity = time.monotonic()
             logger.info(
-                "[SMTP] SEND_SUCCESS recipient=%s data_elapsed=%.2fs",
+                "[SMTP] campaign=%s recipient=%s status=SENT data_elapsed=%.2fs",
+                campaign_id,
                 _redacted_recipient(recipient),
                 data_elapsed,
             )
@@ -779,7 +785,7 @@ class CampaignManager:
 
             try:
                 for recipient_id in (
-                    database.queued_recipient_ids(
+                    database.dispatchable_recipient_ids(
                         campaign_id
                     )
                 ):
@@ -819,7 +825,7 @@ class CampaignManager:
                     "Scheduled campaign check failed"
                 )
 
-            time.sleep(5)
+            time.sleep(1)
 
     def _payload(self, campaign_id):
         with self.payload_lock:
@@ -1164,11 +1170,40 @@ class CampaignManager:
                     / 1024,
                 )
 
+                self._wait_for_rate_limit()
+
+                send_slot = database.begin_recipient_send(
+                    recipient_id,
+                    Config.EMAIL_INTERVAL_SECONDS,
+                )
+                if not send_slot:
+                    database.release_recipient_claim(recipient_id)
+                    logger.info(
+                        "[CAMPAIGN] campaign=%s recipient=%s send_not_started status_changed",
+                        claimed["campaign_id"],
+                        _redacted_recipient(claimed["email"]),
+                    )
+                    continue
+
                 attempt = database.record_attempt(
                     recipient_id
                 )
 
+                logger.info(
+                    "[SCHEDULER] campaign=%s recipient=%s scheduled=%s next_allowed=%s",
+                    claimed["campaign_id"],
+                    _redacted_recipient(claimed["email"]),
+                    send_slot["scheduled_send_time"],
+                    send_slot["next_allowed_send"],
+                )
+
                 send_started = time.monotonic()
+                logger.info(
+                    "[SEND] campaign=%s recipient=%s started=%s",
+                    claimed["campaign_id"],
+                    _redacted_recipient(claimed["email"]),
+                    database.now(),
+                )
 
                 try:
                     logger.info(
@@ -1183,8 +1218,7 @@ class CampaignManager:
                         attempt,
                     )
 
-                    self._wait_for_rate_limit()
-
+                    connection.campaign_id = claimed["campaign_id"]
                     connection.send_message(
                         message_bytes,
                         claimed["email"],
@@ -1197,11 +1231,8 @@ class CampaignManager:
                     )
 
                     logger.info(
-                        "[SMTP] worker=%s "
-                        "recipient=%s "
-                        "action=SUCCESS "
-                        "elapsed=%.2fs",
-                        worker_id,
+                        "[SEND] campaign=%s recipient=%s status=SENT duration=%.2fs",
+                        claimed["campaign_id"],
                         _redacted_recipient(
                             claimed["email"]
                         ),

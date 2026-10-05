@@ -881,6 +881,10 @@ def queued_recipient_ids(campaign_id):
                   'paused'
               )
               AND c.cancellation_requested=0
+              AND NOT EXISTS (
+                  SELECT 1 FROM recipients AS active
+                  WHERE active.campaign_id=c.id AND active.status='sending'
+              )
             ORDER BY r.id
             """,
             (campaign_id,),
@@ -890,6 +894,27 @@ def queued_recipient_ids(campaign_id):
         row[0]
         for row in rows
     ]
+
+
+def dispatchable_recipient_ids(campaign_id):
+    """Return the next recipient only when the campaign may send now."""
+    if not campaign_id:
+        return []
+    with connection() as db:
+        row = db.execute("""
+            SELECT r.id
+            FROM recipients r JOIN campaigns c ON c.id=r.campaign_id
+            WHERE r.campaign_id=? AND r.status='queued'
+              AND c.status IN ('queued','running','resuming')
+              AND c.cancellation_requested=0
+              AND (c.next_run_at IS NULL OR c.next_run_at <= ?)
+              AND NOT EXISTS (
+                  SELECT 1 FROM recipients active
+                  WHERE active.campaign_id=c.id AND active.status='sending'
+              )
+            ORDER BY r.id LIMIT 1
+        """, (campaign_id, now())).fetchone()
+    return [row[0]] if row else []
 
 
 def claim_recipient(
@@ -937,7 +962,8 @@ def claim_recipient(
                 SELECT
                     r.*,
                     c.status AS campaign_status,
-                    c.cancellation_requested
+                    c.cancellation_requested,
+                    c.next_run_at
                 FROM recipients AS r
                 INNER JOIN campaigns AS c
                     ON c.id = r.campaign_id
@@ -957,7 +983,8 @@ def claim_recipient(
                 SELECT
                     r.*,
                     c.status AS campaign_status,
-                    c.cancellation_requested
+                    c.cancellation_requested,
+                    c.next_run_at
                 FROM recipients AS r
                 INNER JOIN campaigns AS c
                     ON c.id = r.campaign_id
@@ -980,6 +1007,17 @@ def claim_recipient(
             return None
 
         if row["cancellation_requested"]:
+            return None
+
+        current_time = now()
+        if row["next_run_at"] and row["next_run_at"] > current_time:
+            return None
+
+        active_recipient = db.execute(
+            "SELECT 1 FROM recipients WHERE campaign_id=? AND status='sending' LIMIT 1",
+            (row["campaign_id"],),
+        ).fetchone()
+        if active_recipient:
             return None
 
         # ----------------------------------------------------------
@@ -1065,6 +1103,65 @@ def claim_recipient(
         claimed = dict(row)
         claimed["iteration_number"] = iteration
         return claimed
+
+
+def begin_recipient_send(recipient_id, interval_seconds):
+    """Authorize an SMTP operation and persist the next campaign send slot."""
+    with connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("""
+            SELECT r.campaign_id, r.email, r.status, c.status AS campaign_status,
+                   c.cancellation_requested, c.next_run_at
+            FROM recipients r JOIN campaigns c ON c.id=r.campaign_id
+            WHERE r.id=?
+        """, (recipient_id,)).fetchone()
+        if (not row or row["status"] != "sending"
+                or row["campaign_status"] not in SENDABLE_CAMPAIGN_STATUSES
+                or row["cancellation_requested"]):
+            return None
+
+        current_time = datetime.now(timezone.utc)
+        if row["next_run_at"]:
+            previous_slot = datetime.fromisoformat(row["next_run_at"])
+            if previous_slot > current_time:
+                return None
+        scheduled_time = current_time
+        if row["next_run_at"]:
+            previous_slot = datetime.fromisoformat(row["next_run_at"])
+            if previous_slot > scheduled_time:
+                scheduled_time = previous_slot
+        next_run_at = (
+            scheduled_time + timedelta(seconds=interval_seconds)
+        ).isoformat()
+        db.execute("UPDATE campaigns SET next_run_at=? WHERE id=?",
+                   (next_run_at, row["campaign_id"]))
+        return {
+            "campaign_id": row["campaign_id"],
+            "email": row["email"],
+            "scheduled_send_time": scheduled_time.isoformat(),
+            "next_allowed_send": next_run_at,
+        }
+
+
+def release_recipient_claim(recipient_id):
+    """Return a pre-send claim to the queue when Pause wins the race."""
+    with connection() as db:
+        row = db.execute(
+            "SELECT campaign_id FROM recipients WHERE id=? AND status='sending'",
+            (recipient_id,),
+        ).fetchone()
+        if not row:
+            return
+        campaign_id = row["campaign_id"]
+        iteration = db.execute(
+            "SELECT current_iteration FROM campaigns WHERE id=?", (campaign_id,)
+        ).fetchone()["current_iteration"]
+        db.execute("UPDATE recipients SET status='queued' WHERE id=? AND status='sending'",
+                   (recipient_id,))
+        db.execute("""
+            UPDATE recipient_iteration_results SET status='queued'
+            WHERE campaign_id=? AND recipient_id=? AND iteration_number=? AND status='sending'
+        """, (campaign_id, recipient_id, iteration))
 
 
 def record_attempt(recipient_id):
@@ -1834,10 +1931,13 @@ def resume_campaign(
                 UPDATE campaigns
                 SET
                     status='resuming',
-                    next_resume_at=NULL
+                    next_resume_at=NULL,
+                    next_run_at=?
                 WHERE id=?
                 """,
-                (campaign_id,),
+                ((datetime.now(timezone.utc) + timedelta(
+                    seconds=Config.EMAIL_INTERVAL_SECONDS
+                )).isoformat(), campaign_id),
             )
             _log_event(db, campaign_id, "CAMPAIGN_RESUMED", "resuming",
                        details="Campaign resume requested")

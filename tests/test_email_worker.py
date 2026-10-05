@@ -31,8 +31,10 @@ class CampaignFailureIsolationTest(unittest.TestCase):
         self.original_username = Config.SMTP_USERNAME
         self.original_password = Config.SMTP_PASSWORD
         self.original_health_check_idle = Config.SMTP_HEALTH_CHECK_IDLE
+        self.original_interval_seconds = Config.EMAIL_INTERVAL_SECONDS
         Config.DATABASE_URL = f"sqlite:///{self.temp_db.name}"
         Config.MAX_EMAIL_RETRIES = 1
+        Config.EMAIL_INTERVAL_SECONDS = 0
         Config.SMTP_USERNAME = "sender@example.test"
         Config.SMTP_PASSWORD = "test-password"
         Config.SMTP_HEALTH_CHECK_IDLE = 30
@@ -44,6 +46,7 @@ class CampaignFailureIsolationTest(unittest.TestCase):
         Config.SMTP_USERNAME = self.original_username
         Config.SMTP_PASSWORD = self.original_password
         Config.SMTP_HEALTH_CHECK_IDLE = self.original_health_check_idle
+        Config.EMAIL_INTERVAL_SECONDS = self.original_interval_seconds
         # The daemon worker can briefly retain SQLite's Windows file handle after
         # queue.join(); a failed cleanup must not invalidate the behavior test.
         try:
@@ -337,6 +340,46 @@ class CampaignFailureIsolationTest(unittest.TestCase):
         self.assertEqual((campaign["current_iteration"], campaign["status"], campaign["queued"]), (2, "queued", 3))
         first_iteration = database.iteration_results(campaign_id, 1)[1]
         self.assertEqual([row["status"] for row in first_iteration], ["sent", "sent", "sent"])
+
+    def test_campaign_interval_gates_claims_and_resume_sets_a_new_slot(self):
+        campaign_id = database.create_campaign(
+            ["one@example.test", "two@example.test"], "Subject", "Body", [],
+        )
+        first_id, second_id = database.queued_recipient_ids(campaign_id)
+        self.assertEqual(database.dispatchable_recipient_ids(campaign_id), [first_id])
+        claimed = database.claim_recipient(first_id, campaign_id)
+        self.assertIsNotNone(claimed)
+        send_slot = database.begin_recipient_send(first_id, 30)
+        self.assertIsNotNone(send_slot)
+        self.assertEqual(database.dispatchable_recipient_ids(campaign_id), [])
+        self.assertIsNone(database.claim_recipient(second_id, campaign_id))
+        database.record_attempt(first_id)
+        database.recipient_result(first_id, "sent")
+
+        with database.connection() as db:
+            db.execute(
+                "UPDATE campaigns SET next_run_at=? WHERE id=?",
+                ("2999-01-01T00:00:00+00:00", campaign_id),
+            )
+        Config.EMAIL_INTERVAL_SECONDS = 30
+        database.pause_campaign(campaign_id)
+        database.resume_campaign(campaign_id)
+        self.assertIsNone(database.claim_recipient(second_id, campaign_id))
+
+        with database.connection() as db:
+            db.execute(
+                "UPDATE campaigns SET next_run_at=NULL WHERE id=?", (campaign_id,)
+            )
+        self.assertIsNotNone(database.claim_recipient(second_id, campaign_id))
+
+    def test_pause_before_smtp_authorization_releases_claim(self):
+        campaign_id = database.create_campaign(["one@example.test"], "Subject", "Body", [])
+        recipient_id = database.queued_recipient_ids(campaign_id)[0]
+        self.assertIsNotNone(database.claim_recipient(recipient_id, campaign_id))
+        database.pause_campaign(campaign_id)
+        self.assertIsNone(database.begin_recipient_send(recipient_id, 30))
+        database.release_recipient_claim(recipient_id)
+        self.assertEqual(database.queued_recipient_ids(campaign_id), [recipient_id])
 
     def test_iteration_ledger_prevents_second_success(self):
         campaign_id = database.create_campaign(["one@example.test"], "Subject", "Body", [])

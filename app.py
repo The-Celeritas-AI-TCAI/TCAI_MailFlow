@@ -272,6 +272,8 @@ def cancel_campaign(campaign_id):
 @app.route("/campaign/<campaign_id>/pause", methods=["POST"])
 def pause_campaign(campaign_id):
     campaign = database.pause_campaign(campaign_id)
+    if campaign and campaign["status"] == "paused":
+        app.logger.info("[CAMPAIGN] campaign=%s status=PAUSED", campaign_id)
     return (jsonify(success=True, message="Campaign paused; any active send can finish safely.", campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
 
 
@@ -279,6 +281,11 @@ def pause_campaign(campaign_id):
 def resume_campaign(campaign_id):
     campaign = database.resume_campaign(campaign_id)
     if campaign and campaign["status"] in ("queued", "running", "resuming"):
+        app.logger.info(
+            "[CAMPAIGN] campaign=%s status=RESUMED next_allowed_send=%s",
+            campaign_id,
+            campaign.get("next_run_at"),
+        )
         campaign_manager.enqueue(campaign_id)
     return (jsonify(success=True, message="Campaign resumed.", campaign=campaign, **campaign), 200) if campaign else (jsonify(success=False, message="Campaign not found."), 404)
 
